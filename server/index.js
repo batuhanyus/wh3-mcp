@@ -29,6 +29,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'url';
 import { CommandTransport } from './lib/command-transport.js';
 import { DiagnosticsReader } from './lib/diagnostics.js';
+import { normalizeUiInspectionArgs } from './lib/ui-inspection.js';
+import { waitForConditions } from './lib/wait-for.js';
 import { resolveBeneathRoot, resolveWh3Install, Wh3ProcessManager } from './lib/wh3-runtime.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -335,6 +337,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             default: false,
           },
         },
+      },
+    },
+    {
+      name: 'wh3_inspect_ui',
+      description: 'Read one UI component as bounded structured data without clicking it. Exact component ids are required. If the id is ambiguous, provide an exact direct-child path or parent_path. Geometry is the raw WH3 UIC coordinate space; it is not converted to desktop/screenshot coordinates.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          component_id: {
+            type: 'string',
+            description: 'Exact UI component Id(), e.g. "wat_harness_launcher".',
+          },
+          path: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional exact direct-child path to the target. It must end with component_id. Include the UI root id only if known.',
+          },
+          parent_path: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional exact direct-child path to the target parent. The target must be a direct child of that parent.',
+          },
+          max_depth: {
+            type: 'number',
+            description: 'Descendant depth to return (default 2, clamped 0..8).',
+            default: 2,
+          },
+          max_nodes: {
+            type: 'number',
+            description: 'Maximum selected+descendant nodes to inspect (default 64, clamped 1..256).',
+            default: 64,
+          },
+        },
+        required: ['component_id'],
       },
     },
     {
@@ -765,6 +801,56 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {},
+      },
+    },
+    {
+      name: 'wh3_wait_for',
+      description: 'Wait for bounded typed game/UI conditions using fresh wh3_get_situation and wh3_inspect_ui observations. Read-only: it never dismisses blockers or changes game state. Default mode is all; any is available explicitly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          conditions: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 16,
+            items: {
+              type: 'object',
+              properties: {
+                type: {
+                  type: 'string',
+                  enum: ['context', 'turn', 'saving', 'blocking.kind', 'ui.exists', 'ui.visible', 'ui.parent_id'],
+                  description: 'Typed condition name. Arbitrary expressions/eval are not supported.',
+                },
+                equals: { description: 'Expected value; type depends on the condition.' },
+                component_id: { type: 'string', description: 'Required for ui.* conditions.' },
+                path: { type: 'array', items: { type: 'string' }, description: 'Optional exact target path for ui.* conditions.' },
+                parent_path: { type: 'array', items: { type: 'string' }, description: 'Optional exact parent path for ui.* conditions.' },
+              },
+              required: ['type'],
+            },
+          },
+          mode: {
+            type: 'string',
+            enum: ['all', 'any'],
+            default: 'all',
+            description: 'all requires every condition in one observation; any succeeds when one condition matches.',
+          },
+          timeout_ms: {
+            type: 'number',
+            default: 30000,
+            description: 'Finite wait bound in milliseconds, clamped to 100..120000.',
+          },
+          poll_interval_ms: {
+            type: 'number',
+            default: 250,
+            description: 'Asynchronous polling interval in milliseconds, clamped to 50..5000.',
+          },
+          max_observations: {
+            type: 'number',
+            description: 'Maximum fresh observations, clamped to 1..500. Defaults from timeout/poll interval.',
+          },
+        },
+        required: ['conditions'],
       },
     },
     {
@@ -1245,7 +1331,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           command: {
             type: 'string',
-            description: 'Command name. Situational awareness: get_situation (prefer this over a screenshot), get_screen, get_hud, get_status. State: ping, get_faction_info, get_treasury, get_regions, get_characters, get_saved_value, set_saved_value, apply_effect_bundle. Events: trigger_dilemma, trigger_dilemma_with_targets, trigger_incident, read_event, answer_dilemma, dismiss_event. Battles: attack (target_settlement for settlements), autoresolve_battle, retreat_battle, occupy_choice, answer_move_options. Battle map: fight_battle, start_battle, set_battle_speed, battle_order, get_battle_units, end_battle, auto_fight, dismiss_battle_results. Diplomacy: open_diplomacy, force_diplomacy, get_diplomacy. Campaign start/load: start_campaign, load_campaign, continue_campaign, new_game, select_campaign, list_races, list_lords, select_race, select_lord, select_playthrough, select_save, confirm_load. Campaign control: open_menu, resume (alias close_menu), confirm_dialog, cancel_dialog, quit_to_menu, exit_to_windows, end_turn, save_game, quick_save. Soak: soak_turns, soak_status, soak_abort. Levers: build_building, transfer_region, start_research, level_character, grant_skill, cco_query. Panels: open_panel, close_panel. Camera: get_camera, set_camera, pan_camera, zoom_to. Armies: get_armies, move_army, teleport_army, select_army. Debug: eval, cm_search, take_screenshot, click_ui, list_ui, dump_children, log_clicks, probe_text, probe_cm',
+            description: 'Command name. Situational awareness: get_situation (prefer this over a screenshot), get_screen, get_hud, get_status. State: ping, get_faction_info, get_treasury, get_regions, get_characters, get_saved_value, set_saved_value, apply_effect_bundle. Events: trigger_dilemma, trigger_dilemma_with_targets, trigger_incident, read_event, answer_dilemma, dismiss_event. Battles: attack (target_settlement for settlements), autoresolve_battle, retreat_battle, occupy_choice, answer_move_options. Battle map: fight_battle, start_battle, set_battle_speed, battle_order, get_battle_units, end_battle, auto_fight, dismiss_battle_results. Diplomacy: open_diplomacy, force_diplomacy, get_diplomacy. Campaign start/load: start_campaign, load_campaign, continue_campaign, new_game, select_campaign, list_races, list_lords, select_race, select_lord, select_playthrough, select_save, confirm_load. Campaign control: open_menu, resume (alias close_menu), confirm_dialog, cancel_dialog, quit_to_menu, exit_to_windows, end_turn, save_game, quick_save. Soak: soak_turns, soak_status, soak_abort. Levers: build_building, transfer_region, start_research, level_character, grant_skill, cco_query. Panels: open_panel, close_panel. Camera: get_camera, set_camera, pan_camera, zoom_to. Armies: get_armies, move_army, teleport_army, select_army. Debug: eval, cm_search, take_screenshot, click_ui, list_ui, inspect_ui, dump_children, log_clicks, probe_text, probe_cm',
           },
           params: {
             type: 'object',
@@ -1264,7 +1350,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 // Call tool
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
 
   switch (name) {
@@ -1385,6 +1471,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return_tree: args?.return_tree,
       }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(listResult, null, 2) }] };
+    }
+
+    case 'wh3_inspect_ui': {
+      if (!isWh3Running()) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: { code: 'GAME_EXITED', message: 'WH3 not running' } }, null, 2) }] };
+      }
+      let inspectArgs;
+      try {
+        inspectArgs = normalizeUiInspectionArgs(args);
+      } catch (error) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'error',
+          error: { code: error?.code ?? 'INVALID_REQUEST', message: error?.message ?? String(error), details: error?.details },
+        }, null, 2) }] };
+      }
+      const inspectResult = await sendCommand('inspect_ui', inspectArgs, 15000);
+      return { content: [{ type: 'text', text: JSON.stringify(inspectResult, null, 2) }] };
     }
 
     case 'wh3_list_races': {
@@ -1748,6 +1851,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       const situationResult = await sendCommand('get_situation', {}, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(situationResult, null, 2) }] };
+    }
+
+    case 'wh3_wait_for': {
+      let waitResult;
+      try {
+        waitResult = await waitForConditions(args, {
+          sendCommand,
+          getIdentity: () => ({
+            running: isWh3Running(),
+            session_id: commandTransport?.sessionId ?? null,
+            run_id: processManager.getStatus().run_id ?? null,
+          }),
+          signal: extra?.signal,
+        });
+      } catch (error) {
+        waitResult = {
+          status: 'error',
+          error: {
+            code: error?.code ?? 'INVALID_REQUEST',
+            message: error?.message ?? String(error),
+            details: error?.details,
+          },
+        };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(waitResult, null, 2) }] };
     }
 
     case 'wh3_read_event': {

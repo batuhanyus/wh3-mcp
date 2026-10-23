@@ -3,6 +3,6 @@
   "pack_name": "wh3_mcp_server.pack",
   "protocol": 2,
   "lua_bridge": "script/_lib/mod/wh3_mcp.lua",
-  "lua_sha256": "1c9a7c3ccc523d9c61884463fd6d49b5d867c53fd06400825bbf7d6796ab961c",
-  "readme_sha256": "87f3c38f2abb1c11121c826d8bf77c7c93ee45e502695a24c11a9b2c8013faf2"
+  "lua_sha256": "af4385dcaeb8343684203de2363745395dfb99818092c5691c388682a52d91d5",
+  "readme_sha256": "5bbed652b0765946ba5773d3b467477f229f72d805ee89c5e7f953b036f1bb10"
 }

@@ -162,9 +162,11 @@ end
 -- Supports: nil, boolean, number, string, table (no circular refs)
 -- ---------------------------------------------------------------------------
 json = {}
+json.null = {}
 
 function json.encode(val, indent)
     indent = indent or ""
+    if val == json.null then return "null" end
     local t = type(val)
     if t == "nil" then return "null"
     elseif t == "boolean" then return tostring(val)
@@ -839,6 +841,372 @@ local function collect_tree(uic, max_depth, visible_only)
     end
     if uic then walk(uic, 0) end
     return lines
+end
+
+
+-- Structured, read-only UI inspection used by inspect_ui. Position() and
+-- Bounds() are returned exactly as the game exposes them. We do not translate
+-- them to OS desktop/screenshot coordinates or infer geometry when an API is
+-- unavailable.
+local INSPECT_MAX_DEPTH = 8
+local INSPECT_MAX_NODES = 256
+local INSPECT_LOOKUP_MAX_NODES = 4096
+local INSPECT_MAX_PATH_SEGMENTS = 64
+
+local function inspect_add_error(errors, code, message, field)
+    local entry = { code = code, message = tostring(message or code) }
+    if field then entry.field = field end
+    errors[#errors + 1] = entry
+end
+
+local function inspect_uic_id(uic)
+    if not uic then return nil end
+    local ok, value = pcall(function() return uic:Id() end)
+    if ok and value ~= nil then return tostring(value) end
+    return nil
+end
+
+local function inspect_identity(uic)
+    if not uic then return nil end
+    local ok_addr, address = pcall(function() return uic:Address() end)
+    if ok_addr and address ~= nil then return "address:" .. tostring(address) end
+    local ok, value = pcall(function() return tostring(uic) end)
+    if ok and value then return value end
+    return nil
+end
+
+local function inspect_child_count(uic, errors)
+    local ok, value = pcall(function() return uic:ChildCount() end)
+    if ok and type(value) == "number" then return math.max(0, math.floor(value)) end
+    inspect_add_error(errors, "API_UNSUPPORTED", value or "ChildCount unavailable", "child_count")
+    return nil
+end
+
+local function inspect_visible(uic, errors)
+    local ok, value = pcall(function() return uic:VisibleFromRoot() end)
+    if ok and value ~= nil then return value and true or false end
+    local ok2, value2 = pcall(function() return uic:Visible() end)
+    if ok2 and value2 ~= nil then return value2 and true or false end
+    inspect_add_error(errors, "API_UNSUPPORTED", value2 or value or "visibility unavailable", "visible")
+    return nil
+end
+
+local function inspect_position(uic, errors)
+    local ok, x, y = pcall(function() return uic:Position() end)
+    if ok and type(x) == "number" and type(y) == "number" then return { x = x, y = y } end
+    inspect_add_error(errors, "API_UNSUPPORTED", x or "Position unavailable", "position")
+    return nil
+end
+
+local function inspect_size(uic, errors)
+    local ok, width, height = pcall(function() return uic:Bounds() end)
+    if ok and type(width) == "number" and type(height) == "number" then
+        return { width = width, height = height }
+    end
+    inspect_add_error(errors, "API_UNSUPPORTED", width or "Bounds unavailable", "size")
+    return nil
+end
+
+local function inspect_text(uic, errors)
+    local ok, value = pcall(function() return uic:GetStateText() end)
+    if ok then
+        if value == nil or value == "" then return nil end
+        return tostring(value)
+    end
+    inspect_add_error(errors, "API_UNSUPPORTED", value or "GetStateText unavailable", "text")
+    return nil
+end
+
+local function inspect_state(uic, errors)
+    local ok, value = pcall(function() return uic:CurrentState() end)
+    if ok then
+        if value == nil or value == "" then return nil end
+        return tostring(value)
+    end
+    inspect_add_error(errors, "API_UNSUPPORTED", value or "CurrentState unavailable", "state")
+    return nil
+end
+
+local function inspect_parent_id(uic, errors)
+    local ok, parent = pcall(function()
+        return uic:Parent()
+    end)
+    if not ok then
+        inspect_add_error(errors, "API_UNSUPPORTED", parent or "Parent unavailable", "parent_id")
+        return nil
+    end
+    return inspect_uic_id(parent)
+end
+
+local function inspect_json_value(value)
+    if value == nil then return json.null end
+    return value
+end
+
+local function inspect_component_fields(uic, path, depth)
+    local errors = {}
+    local out = {
+        component_id = inspect_json_value(inspect_uic_id(uic)),
+        path = inspect_json_value(path),
+        parent_id = inspect_json_value(inspect_parent_id(uic, errors)),
+        visible = inspect_json_value(inspect_visible(uic, errors)),
+        position = inspect_json_value(inspect_position(uic, errors)),
+        size = inspect_json_value(inspect_size(uic, errors)),
+        text = inspect_json_value(inspect_text(uic, errors)),
+        state = inspect_json_value(inspect_state(uic, errors)),
+        child_count = inspect_json_value(inspect_child_count(uic, errors)),
+        errors = errors,
+    }
+    if depth ~= nil then out.depth = depth end
+    return out
+end
+
+local function inspect_validate_path(value, field)
+    if value == nil then return nil end
+    if type(value) ~= "table" or #value < 1 or #value > INSPECT_MAX_PATH_SEGMENTS then
+        return nil, field .. " must be a non-empty array of at most " .. INSPECT_MAX_PATH_SEGMENTS .. " component ids"
+    end
+    local result = {}
+    for i = 1, #value do
+        if type(value[i]) ~= "string" or value[i] == "" then
+            return nil, field .. "[" .. i .. "] must be a non-empty component id string"
+        end
+        result[i] = value[i]
+    end
+    return result
+end
+
+local function inspect_root_with_size(errors)
+    if not core then
+        inspect_add_error(errors, "NO_UI_ROOT", "core is unavailable")
+        return nil, nil
+    end
+    local ok, root = pcall(function() return core:get_ui_root() end)
+    if not ok then
+        inspect_add_error(errors, "LOOKUP_FAILURE", root or "get_ui_root failed")
+        return nil, nil
+    end
+    if not root then
+        inspect_add_error(errors, "NO_UI_ROOT", "UI root is unavailable")
+        return nil, nil
+    end
+    local size_errors = {}
+    local size = inspect_size(root, size_errors)
+    for i = 1, #size_errors do
+        size_errors[i].field = "root_size"
+        errors[#errors + 1] = size_errors[i]
+    end
+    return root, size
+end
+
+local function inspect_direct_path(root, requested, errors, field)
+    local current = root
+    local actual = {}
+    local root_id = inspect_uic_id(root)
+    if root_id then actual[#actual + 1] = root_id end
+    local first = 1
+    if root_id and requested[1] == root_id then first = 2 end
+    for i = first, #requested do
+        local matches = find_all_child_matches(current, requested[i])
+        if #matches == 0 then
+            inspect_add_error(errors, "NOT_FOUND", field .. " segment not found: " .. tostring(requested[i]), field)
+            return nil, nil
+        elseif #matches > 1 then
+            inspect_add_error(errors, "AMBIGUOUS_PATH", field .. " segment is ambiguous: " .. tostring(requested[i]), field)
+            return nil, nil
+        end
+        current = matches[1]
+        actual[#actual + 1] = requested[i]
+    end
+    return current, actual
+end
+
+local function inspect_find_unique(root, component_id, errors)
+    local root_id = inspect_uic_id(root)
+    local stack = { { uic = root, path = root_id and { root_id } or {} } }
+    local seen = {}
+    local matches = {}
+    local scanned = 0
+    while #stack > 0 and scanned < INSPECT_LOOKUP_MAX_NODES do
+        local item = table.remove(stack)
+        local uic = item.uic
+        local identity = inspect_identity(uic)
+        if not identity or not seen[identity] then
+            if identity then seen[identity] = true end
+            scanned = scanned + 1
+            if inspect_uic_id(uic) == component_id then
+                matches[#matches + 1] = { uic = uic, path = item.path }
+            end
+            local cc_errors = {}
+            local cc = inspect_child_count(uic, cc_errors)
+            if cc == nil then
+                inspect_add_error(errors, "LOOKUP_FAILURE", "ChildCount unavailable during component lookup")
+                return nil, nil, false
+            end
+            if cc then
+                for i = cc - 1, 0, -1 do
+                    local ok, child = pcall(function() return UIComponent(uic:Find(i)) end)
+                    if ok and child then
+                        local child_id = inspect_uic_id(child)
+                        local child_path = {}
+                        for j = 1, #item.path do child_path[j] = item.path[j] end
+                        if child_id then child_path[#child_path + 1] = child_id end
+                        stack[#stack + 1] = { uic = child, path = child_path }
+                    end
+                end
+            end
+        end
+    end
+    if #stack > 0 then
+        inspect_add_error(errors, "LOOKUP_TRUNCATED", "component lookup reached the " .. INSPECT_LOOKUP_MAX_NODES .. " node safety bound")
+        return nil, nil, true
+    end
+    if #matches == 0 then
+        inspect_add_error(errors, "NOT_FOUND", "component_id was not found: " .. component_id)
+        return nil, nil, false
+    end
+    if #matches > 1 then
+        local paths = {}
+        local limit = math.min(#matches, 8)
+        for i = 1, limit do paths[i] = table.concat(matches[i].path, " > ") end
+        inspect_add_error(errors, "AMBIGUOUS_MATCH", "multiple components match component_id; use path or parent_path")
+        errors[#errors].matches = paths
+        errors[#errors].match_count = #matches
+        return nil, nil, false
+    end
+    return matches[1].uic, matches[1].path, false
+end
+
+local function inspect_ui(params)
+    params = type(params) == "table" and params or {}
+    local component_id = params.component_id
+    if type(component_id) ~= "string" or component_id == "" then
+        return { status = "error", error = "inspect_ui requires non-empty component_id" }
+    end
+    local path, path_err = inspect_validate_path(params.path, "path")
+    if path_err then return { status = "error", error = path_err } end
+    local parent_path, parent_err = inspect_validate_path(params.parent_path, "parent_path")
+    if parent_err then return { status = "error", error = parent_err } end
+    if path and parent_path then return { status = "error", error = "use either path or parent_path, not both" } end
+    if path and path[#path] ~= component_id then return { status = "error", error = "path must end with component_id" } end
+
+    local max_depth = math.floor(tonumber(params.max_depth) or 2)
+    if max_depth < 0 then max_depth = 0 end
+    if max_depth > INSPECT_MAX_DEPTH then max_depth = INSPECT_MAX_DEPTH end
+    local max_nodes = math.floor(tonumber(params.max_nodes) or 64)
+    if max_nodes < 1 then max_nodes = 1 end
+    if max_nodes > INSPECT_MAX_NODES then max_nodes = INSPECT_MAX_NODES end
+
+    local errors = {}
+    local root, root_size = inspect_root_with_size(errors)
+    local base = {
+        found = false,
+        component_id = component_id,
+        path = json.null,
+        parent_id = json.null,
+        visible = json.null,
+        position = json.null,
+        size = json.null,
+        text = json.null,
+        state = json.null,
+        child_count = json.null,
+        children = {},
+        root_size = inspect_json_value(root_size),
+        errors = errors,
+        truncated = false,
+        max_depth = max_depth,
+        max_nodes = max_nodes,
+        coordinate_space = "raw UIC Position()/Bounds() values; no OS screen-space conversion",
+    }
+    if not root then return { status = "ok", result = base } end
+
+    local selected, selected_path
+    if path then
+        selected, selected_path = inspect_direct_path(root, path, errors, "path")
+        if selected and inspect_uic_id(selected) ~= component_id then
+            inspect_add_error(errors, "LOOKUP_FAILURE", "resolved path component id changed during lookup", "path")
+            selected = nil
+            selected_path = nil
+        end
+    elseif parent_path then
+        local parent, actual_parent = inspect_direct_path(root, parent_path, errors, "parent_path")
+        if parent then
+            local matches = find_all_child_matches(parent, component_id)
+            if #matches == 1 then
+                selected = matches[1]
+                selected_path = {}
+                for i = 1, #actual_parent do selected_path[i] = actual_parent[i] end
+                selected_path[#selected_path + 1] = component_id
+            elseif #matches == 0 then
+                inspect_add_error(errors, "NOT_FOUND", "component_id was not found directly under parent_path")
+            else
+                inspect_add_error(errors, "AMBIGUOUS_MATCH", "multiple direct children match component_id under parent_path")
+                errors[#errors].match_count = #matches
+            end
+        end
+    else
+        local lookup_truncated
+        selected, selected_path, lookup_truncated = inspect_find_unique(root, component_id, errors)
+        if lookup_truncated then base.truncated = true end
+    end
+
+    if not selected then return { status = "ok", result = base } end
+
+    local selected_fields = inspect_component_fields(selected, selected_path, nil)
+    base.found = true
+    base.path = selected_fields.path
+    base.parent_id = selected_fields.parent_id
+    base.visible = selected_fields.visible
+    base.position = selected_fields.position
+    base.size = selected_fields.size
+    base.text = selected_fields.text
+    base.state = selected_fields.state
+    base.child_count = selected_fields.child_count
+    for i = 1, #selected_fields.errors do errors[#errors + 1] = selected_fields.errors[i] end
+
+    local queue = { { uic = selected, path = selected_path, depth = 0 } }
+    local seen = {}
+    local nodes = 0
+    while #queue > 0 do
+        if nodes >= max_nodes then
+            base.truncated = true
+            break
+        end
+        local item = table.remove(queue, 1)
+        local identity = inspect_identity(item.uic)
+        if identity and seen[identity] then
+            base.truncated = true
+            inspect_add_error(errors, "REUSED_COMPONENT", "cyclic/reused UI component skipped during descendant traversal")
+        else
+            if identity then seen[identity] = true end
+            nodes = nodes + 1
+            local node_fields
+            if item.depth > 0 then
+                node_fields = inspect_component_fields(item.uic, item.path, item.depth)
+                base.children[#base.children + 1] = node_fields
+            end
+            local traversal_errors = {}
+            local cc = inspect_child_count(item.uic, traversal_errors)
+            if item.depth >= max_depth then
+                if cc and cc > 0 then base.truncated = true end
+            elseif cc and cc > 0 then
+                for i = 0, cc - 1 do
+                    local ok, child = pcall(function() return UIComponent(item.uic:Find(i)) end)
+                    if ok and child then
+                        local child_id = inspect_uic_id(child)
+                        local child_path = {}
+                        for j = 1, #item.path do child_path[j] = item.path[j] end
+                        if child_id then child_path[#child_path + 1] = child_id end
+                        queue[#queue + 1] = { uic = child, path = child_path, depth = item.depth + 1 }
+                    else
+                        inspect_add_error(errors, "LOOKUP_FAILURE", child or "child lookup failed during traversal")
+                    end
+                end
+            end
+        end
+    end
+    if #queue > 0 then base.truncated = true end
+    return { status = "ok", result = base }
 end
 
 -- ---------------------------------------------------------------------------
@@ -1896,7 +2264,10 @@ end
 -- Newer commands live here with their own upvalue budget; execute_command
 -- delegates any name it does not know.
 local function execute_command_2(cmd, params)
-    if cmd == "occupy_choice" then
+    if cmd == "inspect_ui" then
+        return inspect_ui(params)
+
+    elseif cmd == "occupy_choice" then
         -- Decide the settlement_captured panel. choice matches the option's
         -- dy_option TEXT (case-insensitive substring, e.g. "occupy", "sack",
         -- "raze", "loot", "vassal") or a 1-based index into the options list.

@@ -113,6 +113,13 @@ of what you must handle first. Blocking kinds and their handlers:
   panel             close_panel {}
   esc_menu          resume {}
 
+For bounded orchestration, prefer the MCP tool wh3_wait_for over sleep loops.
+It polls fresh get_situation / inspect_ui observations with typed conditions:
+context, turn, saving, blocking.kind, ui.exists, ui.visible, ui.parent_id.
+Default mode is all; mode=any is explicit. It never auto-clicks blockers or
+changes game state. Do not wait for a state that nothing in the scenario will
+trigger; issue the action that should cause the state first.
+
 
 5. COMMAND REFERENCE
 --------------------
@@ -122,6 +129,7 @@ command-queue-index integers that get_armies / get_characters return.
 State reads:
   ping {}                            get_situation {}
   get_status {}                      get_faction_info {}
+  wh3_wait_for is server-side (MCP tool), not a raw Lua command; see below.
   get_treasury {}                    get_regions {}
   get_characters {}                  get_armies {}
   get_diplomacy {faction?}           get_screen {}
@@ -188,6 +196,11 @@ Discovery and debug:
   cm_search {query, limit?, context?}    (see section 9)
   eval {code}                            (see section 9)
   list_ui {path?, max_depth?, visible_only?, return_tree?}
+  inspect_ui {component_id, path? | parent_path?, max_depth?, max_nodes?}
+      Structured read-only inspection. Exact-id ambiguity is reported; use an
+      exact direct-child path to disambiguate. Position/Bounds values are raw
+      WH3 UI coordinates, not desktop/screenshot coordinates. Bounds: depth
+      0..8, nodes 1..256. Unsupported fields are null with API_UNSUPPORTED.
   click_ui {path}                        dump_children {path, child_index?}
   take_screenshot {filename?}            probe_cm {}
 

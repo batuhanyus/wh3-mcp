@@ -47,6 +47,71 @@ The Node server and Lua bridge use correlated file transport protocol v2. Every 
 
 There is **no v1 fallback**. Do not write raw `{command, params}` files or accept a result merely because `wh3_mcp_result.json` appeared. See `docs/PROTOCOL_V2.md` for the wire contract.
 
+## Structured UI inspection and bounded waits
+
+`wh3_inspect_ui` is the structured counterpart to the existing `wh3_list_ui`. `wh3_list_ui` remains unchanged for discovery/debug dumps; use `wh3_inspect_ui` when an agent needs machine-readable assertions about one exact component. The selector always requires `component_id`. If that id exists more than once, the tool reports ambiguity instead of quietly picking whichever copy happens to be found first. An exact direct-child `path` (ending in the target id) or exact `parent_path` can disambiguate it.
+
+Examples:
+
+```json
+{
+  "component_id": "wat_harness_launcher",
+  "max_depth": 1,
+  "max_nodes": 16
+}
+```
+
+```json
+{
+  "component_id": "button_group_settlement",
+  "max_depth": 0,
+  "max_nodes": 1
+}
+```
+
+An **illustrative, redacted** successful result has this shape; these numbers and paths are examples, not claims about a current WH3 session:
+
+```json
+{
+  "found": true,
+  "component_id": "wat_harness_launcher",
+  "path": ["<ui_root>", "<redacted>", "button_group_settlement", "wat_harness_launcher"],
+  "parent_id": "button_group_settlement",
+  "visible": true,
+  "position": {"x": 100, "y": 200},
+  "size": {"width": 55, "height": 55},
+  "text": null,
+  "state": "active",
+  "child_count": 0,
+  "children": [],
+  "root_size": {"width": 1920, "height": 1080},
+  "errors": [],
+  "truncated": false
+}
+```
+
+Geometry is returned exactly from WH3's UIC `Position()` / `Bounds()` calls. The bridge does not translate those values into desktop, capture-image or multi-monitor coordinates. Unsupported fields remain `null` and are accompanied by an `API_UNSUPPORTED` entry rather than guessed values. Descendant output is bounded by `max_depth` (0..8) and `max_nodes` (1..256); `truncated=true` means the requested/lookup bound prevented a complete traversal.
+
+`wh3_wait_for` replaces arbitrary sleep loops with fresh, bounded reads. Conditions are typed: `context`, `turn`, `saving`, `blocking.kind`, `ui.exists`, `ui.visible`, and `ui.parent_id`. The default `mode` is `all`; `mode: "any"` is explicit. UI conditions use the same exact selectors as `wh3_inspect_ui`. The result records elapsed time, the final observation, unmet conditions and a compact changed-state timeline. Process exit, session replacement, cancellation, unsupported conditions and unavailable/failed UI lookup are distinct outcomes.
+
+Example campaign/UI readiness wait:
+
+```json
+{
+  "conditions": [
+    {"type": "context", "equals": "campaign"},
+    {"type": "saving", "equals": false},
+    {"type": "ui.exists", "component_id": "wat_harness_launcher", "equals": true},
+    {"type": "ui.visible", "component_id": "wat_harness_launcher", "equals": true},
+    {"type": "ui.parent_id", "component_id": "wat_harness_launcher", "equals": "button_group_settlement"}
+  ],
+  "timeout_ms": 30000,
+  "poll_interval_ms": 250
+}
+```
+
+`wh3_wait_for` is read-only. A blocker is observed, never auto-dismissed; the tool will not answer dilemmas, move armies or otherwise manufacture progress. It is also the wrong tool for a state that the scenario itself never triggers. For example, waiting for a settlement panel to become visible is pointless if no preceding action opens/selects a settlement. Use a deliberate action first, then wait for the resulting observable state.
+
 ## Offline release gate
 
 From `server/` run:
