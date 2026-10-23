@@ -24,9 +24,10 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn, execSync } from 'child_process';
-import { readFileSync, writeFileSync, unlinkSync, existsSync, copyFileSync, statSync, readdirSync } from 'fs';
+import { readFileSync, existsSync, copyFileSync, statSync, readdirSync } from 'fs';
 import { join, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
+import { CommandTransport } from './lib/command-transport.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -239,62 +240,23 @@ function getWh3Status() {
     exe: WH3_EXE,
     command_file: COMMAND_FILE,
     result_file: RESULT_FILE,
+    transport: commandTransport?.getStatus?.() ?? null,
   };
 }
 
 // ---------------------------------------------------------------------------
-// File-based Communication
+// File-based Communication (protocol v2)
 // ---------------------------------------------------------------------------
 
-function sendCommand(command, params = {}, timeoutMs = 60000) {
-  const payload = { command, params };
-  const json = JSON.stringify(payload);
+const commandTransport = new CommandTransport({
+  rootDir: WH3_PATH,
+  commandFile: COMMAND_FILE,
+  resultFile: RESULT_FILE,
+  isGameRunning: isWh3Running,
+});
 
-  // Write command file
-  writeFileSync(COMMAND_FILE, json, 'utf8');
-
-  // Wait for the result file to appear (mod deletes command file, writes result)
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    // Small sleep to avoid busy-spinning the CPU
-    for (let i = 0; i < 100000; i++) {} // crude yield
-
-    if (!existsSync(COMMAND_FILE)) {
-      // Command file was consumed, result should be ready
-      if (existsSync(RESULT_FILE)) {
-        const result = readFileSync(RESULT_FILE, 'utf8');
-        unlinkSync(RESULT_FILE);
-        try {
-          return JSON.parse(result);
-        } catch {
-          return { status: 'error', error: `failed to parse result: ${result}` };
-        }
-      }
-    }
-
-    if (Date.now() - start > timeoutMs) {
-      // Timeout: check if command file still exists
-      if (existsSync(COMMAND_FILE)) {
-        return { status: 'timeout', error: `no response within ${timeoutMs}ms` };
-      }
-      if (existsSync(RESULT_FILE)) {
-        const result = readFileSync(RESULT_FILE, 'utf8');
-        unlinkSync(RESULT_FILE);
-        try {
-          return JSON.parse(result);
-        } catch {
-          return { status: 'error', error: `failed to parse result: ${result}` };
-        }
-      }
-      return { status: 'timeout', error: 'command consumed but no result file found' };
-    }
-  }
-  return { status: 'timeout', error: `no response within ${timeoutMs}ms` };
-}
-
-function clearFiles() {
-  try { if (existsSync(COMMAND_FILE)) unlinkSync(COMMAND_FILE); } catch {}
-  try { if (existsSync(RESULT_FILE)) unlinkSync(RESULT_FILE); } catch {}
+async function sendCommand(command, params = {}, timeoutMs = 60000) {
+  return commandTransport.send(command, params, timeoutMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1430,7 +1392,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case 'wh3_stop': {
       const result = stopWh3();
-      clearFiles();
+      await commandTransport.reset();
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       };
@@ -1444,8 +1406,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case 'wh3_ping': {
-      clearFiles();
-      const result = sendCommand('ping', {}, 10000);
+      const result = await sendCommand('ping', {}, 10000);
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       };
@@ -1457,8 +1418,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let lastError = null;
 
       while (Date.now() - start < timeout) {
-        clearFiles();
-        const result = sendCommand('ping', {}, 5000);
+          const result = await sendCommand('ping', {}, 5000);
         if (result.status === 'ok') {
           return {
             content: [{ type: 'text', text: JSON.stringify({ status: 'ok', waited_ms: Date.now() - start }, null, 2) }],
@@ -1482,9 +1442,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
       // Try UI click first, fall back to frontend API
-      const result = sendCommand('start_campaign', {
+      const result = await sendCommand('start_campaign', {
         campaign_key: args?.campaign_key ?? 'wh3_main_combi',
         faction_key: args?.faction_key ?? 'mixer_cth_shenzoo',
         party_key: args?.party_key ?? 'wh3_main_cth_shenzoo',
@@ -1496,8 +1455,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const result = sendCommand('take_screenshot', {
+      const result = await sendCommand('take_screenshot', {
         filename: args?.filename ?? 'wh3_mcp_screenshot.tga',
       }, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
@@ -1507,8 +1465,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const loadResult = sendCommand('load_campaign', {
+      const loadResult = await sendCommand('load_campaign', {
         filename: args.filename,
       }, 60000);
       return { content: [{ type: 'text', text: JSON.stringify(loadResult, null, 2) }] };
@@ -1518,8 +1475,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const contResult = sendCommand('continue_campaign', {}, 60000);
+      const contResult = await sendCommand('continue_campaign', {}, 60000);
       return { content: [{ type: 'text', text: JSON.stringify(contResult, null, 2) }] };
     }
 
@@ -1527,8 +1483,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const clickResult = sendCommand('click_ui', {
+      const clickResult = await sendCommand('click_ui', {
         path: args.path,
         child_index: args.child_index,
       }, 15000);
@@ -1539,8 +1494,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const listResult = sendCommand('list_ui', {
+      const listResult = await sendCommand('list_ui', {
         path: args?.path,
         max_depth: args?.max_depth,
         visible_only: args?.visible_only,
@@ -1553,8 +1507,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const racesResult = sendCommand('list_races', {}, 15000);
+      const racesResult = await sendCommand('list_races', {}, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(racesResult, null, 2) }] };
     }
 
@@ -1562,8 +1515,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const lordsResult = sendCommand('list_lords', {}, 15000);
+      const lordsResult = await sendCommand('list_lords', {}, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(lordsResult, null, 2) }] };
     }
 
@@ -1571,8 +1523,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const selectRaceResult = sendCommand('select_race', {
+      const selectRaceResult = await sendCommand('select_race', {
         culture_key: args?.culture_key,
         index: args?.index,
       }, 15000);
@@ -1583,8 +1534,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const selectLordResult = sendCommand('select_lord', {
+      const selectLordResult = await sendCommand('select_lord', {
         faction_key: args?.faction_key,
         index: args?.index,
       }, 15000);
@@ -1595,8 +1545,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const newGameResult = sendCommand('new_game', {}, 10000);
+      const newGameResult = await sendCommand('new_game', {}, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(newGameResult, null, 2) }] };
     }
 
@@ -1604,8 +1553,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const selCampResult = sendCommand('select_campaign', {
+      const selCampResult = await sendCommand('select_campaign', {
         campaign_type: args.campaign_type,
       }, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(selCampResult, null, 2) }] };
@@ -1615,8 +1563,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const screenResult = sendCommand('get_screen', {}, 10000);
+      const screenResult = await sendCommand('get_screen', {}, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(screenResult, null, 2) }] };
     }
 
@@ -1624,8 +1571,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const ptResult = sendCommand('get_screen', {}, 10000);
+      const ptResult = await sendCommand('get_screen', {}, 10000);
       // Extract just the playthrough data from get_screen
       if (ptResult.status === 'ok' && ptResult.result?.screen === 'load_game') {
         ptResult.result = ptResult.result.details.playthroughs || [];
@@ -1637,8 +1583,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const svResult = sendCommand('get_screen', {}, 10000);
+      const svResult = await sendCommand('get_screen', {}, 10000);
       // Extract just the save data from get_screen
       if (svResult.status === 'ok' && svResult.result?.screen === 'load_game') {
         svResult.result = svResult.result.details.saves || [];
@@ -1650,8 +1595,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const ptResult = sendCommand('select_playthrough', { index: args.index }, 10000);
+      const ptResult = await sendCommand('select_playthrough', { index: args.index }, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(ptResult, null, 2) }] };
     }
 
@@ -1659,8 +1603,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const saveResult = sendCommand('select_save', {
+      const saveResult = await sendCommand('select_save', {
         index: args?.index,
         name: args?.name,
       }, 10000);
@@ -1671,8 +1614,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const loadResult = sendCommand('confirm_load', {}, 120000);
+      const loadResult = await sendCommand('confirm_load', {}, 120000);
       return { content: [{ type: 'text', text: JSON.stringify(loadResult, null, 2) }] };
     }
 
@@ -1680,11 +1622,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
       // Try the advice_text_panel close button first, fall back to button_accept
-      let advResult = sendCommand('click_ui', { path: ['advice_interface', 'text_parent', 'advice_text_panel', 'maximised_button_docker', 'button_close'] }, 10000);
+      let advResult = await sendCommand('click_ui', { path: ['advice_interface', 'text_parent', 'advice_text_panel', 'maximised_button_docker', 'button_close'] }, 10000);
       if (advResult.status === 'error') {
-        advResult = sendCommand('click_ui', { path: ['advice_interface', 'button_set', 'accept_holder', 'button_accept'] }, 10000);
+        advResult = await sendCommand('click_ui', { path: ['advice_interface', 'button_set', 'accept_holder', 'button_accept'] }, 10000);
       }
       return { content: [{ type: 'text', text: JSON.stringify(advResult, null, 2) }] };
     }
@@ -1693,11 +1634,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
       // Try mission_review path, fall back to generic button_accept
-      let missResult = sendCommand('click_ui', { path: ['mission_review', 'quest_details', 'quest_list_details', 'footer', 'button_accept'] }, 10000);
+      let missResult = await sendCommand('click_ui', { path: ['mission_review', 'quest_details', 'quest_list_details', 'footer', 'button_accept'] }, 10000);
       if (missResult.status === 'error') {
-        missResult = sendCommand('click_ui', { path: ['button_accept'] }, 10000);
+        missResult = await sendCommand('click_ui', { path: ['button_accept'] }, 10000);
       }
       return { content: [{ type: 'text', text: JSON.stringify(missResult, null, 2) }] };
     }
@@ -1706,8 +1646,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const shenResult = sendCommand('click_ui', { path: ['passing_advisor_menu', 'passing_dargon_exit_button'] }, 10000);
+      const shenResult = await sendCommand('click_ui', { path: ['passing_advisor_menu', 'passing_dargon_exit_button'] }, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(shenResult, null, 2) }] };
     }
 
@@ -1715,8 +1654,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const menuResult = sendCommand('open_menu', {}, 10000);
+      const menuResult = await sendCommand('open_menu', {}, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(menuResult, null, 2) }] };
     }
 
@@ -1724,8 +1662,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const resumeResult = sendCommand('resume', {}, 10000);
+      const resumeResult = await sendCommand('resume', {}, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(resumeResult, null, 2) }] };
     }
 
@@ -1733,8 +1670,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const confirmResult = sendCommand('confirm_dialog', {}, 10000);
+      const confirmResult = await sendCommand('confirm_dialog', {}, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(confirmResult, null, 2) }] };
     }
 
@@ -1742,8 +1678,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const cancelResult = sendCommand('cancel_dialog', {}, 10000);
+      const cancelResult = await sendCommand('cancel_dialog', {}, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(cancelResult, null, 2) }] };
     }
 
@@ -1751,10 +1686,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
       // The mod defers this: it clicks quit, confirms the dialog, then writes
       // the result from the next script instance after the context reload.
-      const quitResult = sendCommand('quit_to_menu', {}, 120000);
+      const quitResult = await sendCommand('quit_to_menu', {}, 120000);
       return { content: [{ type: 'text', text: JSON.stringify(quitResult, null, 2) }] };
     }
 
@@ -1762,11 +1696,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
       // The mod writes its result BEFORE clicking confirm, because the process
       // dies on the click. If that result never lands, the process vanishing is
       // itself proof the exit worked.
-      const exitResult = sendCommand('exit_to_windows', {}, 20000);
+      const exitResult = await sendCommand('exit_to_windows', {}, 20000);
       if (exitResult.status === 'ok') {
         return { content: [{ type: 'text', text: JSON.stringify(exitResult, null, 2) }] };
       }
@@ -1775,8 +1708,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         await new Promise(r => setTimeout(r, 1000));
         if (!isWh3Running()) {
           wh3Process = null;
-          clearFiles();
-          return {
+              return {
             content: [{ type: 'text', text: JSON.stringify({
               status: 'ok',
               result: { exiting: true, confirmed_by: 'process_exited' },
@@ -1798,8 +1730,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const endTurnResult = sendCommand('end_turn', {
+      const endTurnResult = await sendCommand('end_turn', {
         method: args?.method ?? 'api',
         force: args?.force ?? false,
       }, 30000);
@@ -1810,8 +1741,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const hudResult = sendCommand('get_hud', {}, 15000);
+      const hudResult = await sendCommand('get_hud', {}, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(hudResult, null, 2) }] };
     }
 
@@ -1819,8 +1749,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const openPanelResult = sendCommand('open_panel', { panel: args.panel }, 10000);
+      const openPanelResult = await sendCommand('open_panel', { panel: args.panel }, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(openPanelResult, null, 2) }] };
     }
 
@@ -1828,8 +1757,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const closePanelResult = sendCommand('close_panel', { panel: args?.panel }, 10000);
+      const closePanelResult = await sendCommand('close_panel', { panel: args?.panel }, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(closePanelResult, null, 2) }] };
     }
 
@@ -1837,8 +1765,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const camResult = sendCommand('get_camera', {}, 10000);
+      const camResult = await sendCommand('get_camera', {}, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(camResult, null, 2) }] };
     }
 
@@ -1846,8 +1773,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const setCamResult = sendCommand('set_camera', {
+      const setCamResult = await sendCommand('set_camera', {
         x: args?.x, y: args?.y, d: args?.d, b: args?.b, h: args?.h,
       }, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(setCamResult, null, 2) }] };
@@ -1857,8 +1783,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const panResult = sendCommand('pan_camera', {
+      const panResult = await sendCommand('pan_camera', {
         x: args?.x, y: args?.y, d: args?.d, b: args?.b, h: args?.h,
         time: args?.time ?? 2,
       }, 10000);
@@ -1869,8 +1794,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const zoomResult = sendCommand('zoom_to', {
+      const zoomResult = await sendCommand('zoom_to', {
         cqi: args?.cqi,
         region: args?.region,
         time: args?.time ?? 2,
@@ -1882,8 +1806,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const armiesResult = sendCommand('get_armies', { faction: args?.faction }, 15000);
+      const armiesResult = await sendCommand('get_armies', { faction: args?.faction }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(armiesResult, null, 2) }] };
     }
 
@@ -1891,8 +1814,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const moveResult = sendCommand('move_army', {
+      const moveResult = await sendCommand('move_army', {
         cqi: args.cqi, x: args.x, y: args.y, queued: args?.queued ?? false,
       }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(moveResult, null, 2) }] };
@@ -1902,8 +1824,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const teleResult = sendCommand('teleport_army', {
+      const teleResult = await sendCommand('teleport_army', {
         cqi: args.cqi, x: args.x, y: args.y,
       }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(teleResult, null, 2) }] };
@@ -1913,8 +1834,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const selectArmyResult = sendCommand('select_army', {
+      const selectArmyResult = await sendCommand('select_army', {
         cqi: args?.cqi, name: args?.name,
       }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(selectArmyResult, null, 2) }] };
@@ -1924,8 +1844,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const saveResult = sendCommand('save_game', {
+      const saveResult = await sendCommand('save_game', {
         filename: args?.filename ?? 'wh3_mcp_autosave',
         overwrite: args?.overwrite ?? true,
       }, 30000);
@@ -1936,8 +1855,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const quickSaveResult = sendCommand('quick_save', {}, 15000);
+      const quickSaveResult = await sendCommand('quick_save', {}, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(quickSaveResult, null, 2) }] };
     }
 
@@ -1945,8 +1863,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const situationResult = sendCommand('get_situation', {}, 15000);
+      const situationResult = await sendCommand('get_situation', {}, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(situationResult, null, 2) }] };
     }
 
@@ -1954,8 +1871,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const eventResult = sendCommand('read_event', {}, 10000);
+      const eventResult = await sendCommand('read_event', {}, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(eventResult, null, 2) }] };
     }
 
@@ -1963,8 +1879,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const answerResult = sendCommand('answer_dilemma', { choice: args.choice }, 10000);
+      const answerResult = await sendCommand('answer_dilemma', { choice: args.choice }, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(answerResult, null, 2) }] };
     }
 
@@ -1972,8 +1887,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const dismissResult = sendCommand('dismiss_event', {}, 10000);
+      const dismissResult = await sendCommand('dismiss_event', {}, 10000);
       return { content: [{ type: 'text', text: JSON.stringify(dismissResult, null, 2) }] };
     }
 
@@ -1981,8 +1895,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const dilemmaResult = sendCommand('trigger_dilemma', {
+      const dilemmaResult = await sendCommand('trigger_dilemma', {
         dilemma_key: args.dilemma_key,
         faction: args?.faction,
         fire_immediately: args?.fire_immediately ?? true,
@@ -1995,8 +1908,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const incidentResult = sendCommand('trigger_incident', {
+      const incidentResult = await sendCommand('trigger_incident', {
         incident_key: args.incident_key,
         faction: args?.faction,
         fire_immediately: args?.fire_immediately ?? true,
@@ -2008,8 +1920,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const attackResult = sendCommand('attack', {
+      const attackResult = await sendCommand('attack', {
         attacker_cqi: args.attacker_cqi,
         target_cqi: args?.target_cqi,
         target_settlement: args?.target_settlement,
@@ -2023,8 +1934,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const occupyResult = sendCommand('occupy_choice', { choice: args?.choice }, 15000);
+      const occupyResult = await sendCommand('occupy_choice', { choice: args?.choice }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(occupyResult, null, 2) }] };
     }
 
@@ -2032,9 +1942,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
       // Deferred in the mod when a war confirmation follows the click.
-      const moveOptsResult = sendCommand('answer_move_options', {
+      const moveOptsResult = await sendCommand('answer_move_options', {
         option: args.option,
         confirm_war: args?.confirm_war,
       }, 30000);
@@ -2045,10 +1954,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
       // Deferred in the mod: it clicks autoresolve, waits for the results
       // panel, clears it, then writes the result. Allow for all three stages.
-      const autoResult = sendCommand('autoresolve_battle', {
+      const autoResult = await sendCommand('autoresolve_battle', {
         win: args?.win ?? true,
         captives: args?.captives ?? 'kill',
       }, 60000);
@@ -2059,8 +1967,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const retreatResult = sendCommand('retreat_battle', {}, 15000);
+      const retreatResult = await sendCommand('retreat_battle', {}, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(retreatResult, null, 2) }] };
     }
 
@@ -2068,9 +1975,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
       // Deferred: the mod waits for diplomacy_dropdown, then clicks the row.
-      const diploResult = sendCommand('open_diplomacy', { faction: args?.faction }, 30000);
+      const diploResult = await sendCommand('open_diplomacy', { faction: args?.faction }, 30000);
       return { content: [{ type: 'text', text: JSON.stringify(diploResult, null, 2) }] };
     }
 
@@ -2078,8 +1984,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const forceResult = sendCommand('force_diplomacy', {
+      const forceResult = await sendCommand('force_diplomacy', {
         action: args.action,
         faction_a: args?.faction_a,
         faction_b: args.faction_b,
@@ -2093,62 +1998,60 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const getDiploResult = sendCommand('get_diplomacy', { faction: args?.faction }, 15000);
+      const getDiploResult = await sendCommand('get_diplomacy', { faction: args?.faction }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(getDiploResult, null, 2) }] };
     }
 
     case 'wh3_soak_turns': {
-      if (!isWh3Running()) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
-      }
-      clearFiles();
-      const ack = sendCommand('soak_turns', {
-        turns: args?.turns,
-        battle_policy: args?.battle_policy,
-        rig_battles: args?.rig_battles,
-        captives: args?.captives,
-        dilemma_choice: args?.dilemma_choice,
-        occupation: args?.occupation,
-        suppress_events: args?.suppress_events,
-        max_seconds_per_turn: args?.max_seconds_per_turn,
-      }, 15000);
-      if (ack?.status !== 'ok') {
-        return { content: [{ type: 'text', text: JSON.stringify(ack, null, 2) }] };
-      }
-      // The mod acks immediately and runs the soak in its poll loop; poll
-      // soak_status here until it reports finished (or the deadline passes).
-      const soakTurns = args?.turns ?? 5;
-      const perTurnMs = (args?.max_seconds_per_turn ?? 300) * 1000;
-      const deadline = Date.now() + soakTurns * perTurnMs + 60000;
-      let lastStatus = ack;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 10000));
+      return await commandTransport.withExclusiveLease(async () => {
         if (!isWh3Running()) {
-          return { content: [{ type: 'text', text: JSON.stringify({
-            status: 'error', error: 'WH3 process died mid-soak (CTD?) — run wh3_check_errors', last_status: lastStatus,
-          }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
         }
-        clearFiles();
-        const st = sendCommand('soak_status', {}, 20000);
-        if (st?.status === 'ok' && st.result) {
-          lastStatus = st;
-          if (st.result.finished || !st.result.running) {
-            return { content: [{ type: 'text', text: JSON.stringify(st, null, 2) }] };
+        const ack = await sendCommand('soak_turns', {
+          turns: args?.turns,
+          battle_policy: args?.battle_policy,
+          rig_battles: args?.rig_battles,
+          captives: args?.captives,
+          dilemma_choice: args?.dilemma_choice,
+          occupation: args?.occupation,
+          suppress_events: args?.suppress_events,
+          max_seconds_per_turn: args?.max_seconds_per_turn,
+        }, 15000);
+        if (ack?.status !== 'ok') {
+          return { content: [{ type: 'text', text: JSON.stringify(ack, null, 2) }] };
+        }
+        // The mod acks immediately and runs the soak in its poll loop; poll
+        // soak_status here until it reports finished (or the deadline passes).
+        const soakTurns = args?.turns ?? 5;
+        const perTurnMs = (args?.max_seconds_per_turn ?? 300) * 1000;
+        const deadline = Date.now() + soakTurns * perTurnMs + 60000;
+        let lastStatus = ack;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 10000));
+          if (!isWh3Running()) {
+            return { content: [{ type: 'text', text: JSON.stringify({
+              status: 'error', error: 'WH3 process died mid-soak (CTD?) — run wh3_check_errors', last_status: lastStatus,
+            }, null, 2) }] };
+          }
+            const st = await sendCommand('soak_status', {}, 20000);
+          if (st?.status === 'ok' && st.result) {
+            lastStatus = st;
+            if (st.result.finished || !st.result.running) {
+              return { content: [{ type: 'text', text: JSON.stringify(st, null, 2) }] };
+            }
           }
         }
-      }
-      return { content: [{ type: 'text', text: JSON.stringify({
-        status: 'timeout', error: 'soak did not finish before the server-side deadline — wh3_soak_status / wh3_soak_abort still work', last_status: lastStatus,
-      }, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'timeout', error: 'soak did not finish before the server-side deadline — wh3_soak_status / wh3_soak_abort still work', last_status: lastStatus,
+        }, null, 2) }] };
+      }, { allowCommands: ['soak_status', 'soak_abort'] });
     }
 
     case 'wh3_soak_status': {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const soakStatus = sendCommand('soak_status', {}, 20000);
+      const soakStatus = await sendCommand('soak_status', {}, 20000);
       return { content: [{ type: 'text', text: JSON.stringify(soakStatus, null, 2) }] };
     }
 
@@ -2156,75 +2059,72 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const soakAbort = sendCommand('soak_abort', {}, 20000);
+      const soakAbort = await sendCommand('soak_abort', {}, 20000);
       return { content: [{ type: 'text', text: JSON.stringify(soakAbort, null, 2) }] };
     }
 
     case 'wh3_fight_battle': {
-      if (!isWh3Running()) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
-      }
-      clearFiles();
-      const auto = args?.auto !== false;
-      const ack = sendCommand('fight_battle', {
-        auto,
-        speed: args?.speed,
-        max_ticks: args?.max_ticks,
-      }, 20000);
-      if (ack?.status !== 'ok') {
-        return { content: [{ type: 'text', text: JSON.stringify(ack, null, 2) }] };
-      }
-      // The battle context loads with a script reload (poll gap: commands go
-      // unanswered until the new instance's poll loop is up). Poll
-      // get_situation; context "battle" = ready, and for auto runs the flip
-      // back to "campaign" = done.
-      const deadline = Date.now() + (args?.max_wait_s ?? 600) * 1000;
-      let sawBattle = false;
-      let last = ack;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 10000));
+      return await commandTransport.withExclusiveLease(async () => {
         if (!isWh3Running()) {
-          return { content: [{ type: 'text', text: JSON.stringify({
-            status: 'error', error: 'WH3 process died mid-battle (CTD?) — run wh3_check_errors', last_status: last,
-          }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
         }
-        clearFiles();
-        const sit = sendCommand('get_situation', {}, 20000);
-        if (sit?.status !== 'ok' || !sit.result) continue; // poll gap
-        last = sit;
-        const ctx = sit.result.context;
-        if (ctx === 'battle') {
-          sawBattle = true;
-          if (!auto) {
-            return { content: [{ type: 'text', text: JSON.stringify(sit, null, 2) }] };
+        const auto = args?.auto !== false;
+        const ack = await sendCommand('fight_battle', {
+          auto,
+          speed: args?.speed,
+          max_ticks: args?.max_ticks,
+        }, 20000);
+        if (ack?.status !== 'ok') {
+          return { content: [{ type: 'text', text: JSON.stringify(ack, null, 2) }] };
+        }
+        // The battle context loads with a script reload (poll gap: commands go
+        // unanswered until the new instance's poll loop is up). Poll
+        // get_situation; context "battle" = ready, and for auto runs the flip
+        // back to "campaign" = done.
+        const deadline = Date.now() + (args?.max_wait_s ?? 600) * 1000;
+        let sawBattle = false;
+        let last = ack;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 10000));
+          if (!isWh3Running()) {
+            return { content: [{ type: 'text', text: JSON.stringify({
+              status: 'error', error: 'WH3 process died mid-battle (CTD?) — run wh3_check_errors', last_status: last,
+            }, null, 2) }] };
           }
-        } else if (ctx === 'campaign' && sawBattle) {
-          // Auto run finished — clear the post-battle panel and report.
-          clearFiles();
-          const dis = sendCommand('dismiss_battle_results', { captives: args?.captives }, 60000);
-          return { content: [{ type: 'text', text: JSON.stringify({
-            status: 'ok', result: {
-              battle_fought: true,
-              post_battle: dis?.status === 'ok' ? dis.result : dis,
-              situation: sit.result,
-            },
-          }, null, 2) }] };
+            const sit = await sendCommand('get_situation', {}, 20000);
+          if (sit?.status !== 'ok' || !sit.result) continue; // poll gap
+          last = sit;
+          const ctx = sit.result.context;
+          if (ctx === 'battle') {
+            sawBattle = true;
+            if (!auto) {
+              return { content: [{ type: 'text', text: JSON.stringify(sit, null, 2) }] };
+            }
+          } else if (ctx === 'campaign' && sawBattle) {
+            // Auto run finished — clear the post-battle panel and report.
+                const dis = await sendCommand('dismiss_battle_results', { captives: args?.captives }, 60000);
+            return { content: [{ type: 'text', text: JSON.stringify({
+              status: 'ok', result: {
+                battle_fought: true,
+                post_battle: dis?.status === 'ok' ? dis.result : dis,
+                situation: sit.result,
+              },
+            }, null, 2) }] };
+          }
         }
-      }
-      return { content: [{ type: 'text', text: JSON.stringify({
-        status: 'timeout',
-        error: 'battle round trip did not finish before max_wait_s — the game keeps running; poll wh3_get_situation',
-        last_status: last,
-      }, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'timeout',
+          error: 'battle round trip did not finish before max_wait_s — the game keeps running; poll wh3_get_situation',
+          last_status: last,
+        }, null, 2) }] };
+      });
     }
 
     case 'wh3_start_battle': {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const sbResult = sendCommand('start_battle', {}, 15000);
+      const sbResult = await sendCommand('start_battle', {}, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(sbResult, null, 2) }] };
     }
 
@@ -2232,8 +2132,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const spdResult = sendCommand('set_battle_speed', { speed: args?.speed }, 15000);
+      const spdResult = await sendCommand('set_battle_speed', { speed: args?.speed }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(spdResult, null, 2) }] };
     }
 
@@ -2241,8 +2140,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const ordResult = sendCommand('battle_order', {
+      const ordResult = await sendCommand('battle_order', {
         order: args?.order,
         unit_indices: args?.unit_indices,
         target_index: args?.target_index,
@@ -2254,8 +2152,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const buResult = sendCommand('get_battle_units', {}, 20000);
+      const buResult = await sendCommand('get_battle_units', {}, 20000);
       return { content: [{ type: 'text', text: JSON.stringify(buResult, null, 2) }] };
     }
 
@@ -2263,8 +2160,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const ebResult = sendCommand('end_battle', {}, 20000);
+      const ebResult = await sendCommand('end_battle', {}, 20000);
       return { content: [{ type: 'text', text: JSON.stringify(ebResult, null, 2) }] };
     }
 
@@ -2272,8 +2168,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const afResult = sendCommand('auto_fight', {
+      const afResult = await sendCommand('auto_fight', {
         speed: args?.speed,
         max_ticks: args?.max_ticks,
       }, 15000);
@@ -2284,8 +2179,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const dbrResult = sendCommand('dismiss_battle_results', { captives: args?.captives }, 60000);
+      const dbrResult = await sendCommand('dismiss_battle_results', { captives: args?.captives }, 60000);
       return { content: [{ type: 'text', text: JSON.stringify(dbrResult, null, 2) }] };
     }
 
@@ -2335,8 +2229,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const buildResult = sendCommand('build_building', { region: args.region, building: args.building }, 15000);
+      const buildResult = await sendCommand('build_building', { region: args.region, building: args.building }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(buildResult, null, 2) }] };
     }
 
@@ -2344,8 +2237,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const transferResult = sendCommand('transfer_region', { region: args.region, faction: args?.faction }, 15000);
+      const transferResult = await sendCommand('transfer_region', { region: args.region, faction: args?.faction }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(transferResult, null, 2) }] };
     }
 
@@ -2353,8 +2245,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const researchResult = sendCommand('start_research', { tech_key: args.tech_key }, 30000);
+      const researchResult = await sendCommand('start_research', { tech_key: args.tech_key }, 30000);
       return { content: [{ type: 'text', text: JSON.stringify(researchResult, null, 2) }] };
     }
 
@@ -2362,8 +2253,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const levelResult = sendCommand('level_character', { cqi: args.cqi, levels: args?.levels }, 15000);
+      const levelResult = await sendCommand('level_character', { cqi: args.cqi, levels: args?.levels }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(levelResult, null, 2) }] };
     }
 
@@ -2371,8 +2261,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const skillResult = sendCommand('grant_skill', { cqi: args.cqi, skill_key: args.skill_key }, 15000);
+      const skillResult = await sendCommand('grant_skill', { cqi: args.cqi, skill_key: args.skill_key }, 15000);
       return { content: [{ type: 'text', text: JSON.stringify(skillResult, null, 2) }] };
     }
 
@@ -2380,8 +2269,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const ccoResult = sendCommand('cco_query', {
+      const ccoResult = await sendCommand('cco_query', {
         expression: args.expression,
         object_id: args?.object_id,
         type: args?.type,
@@ -2395,8 +2283,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
       deployDocsCorpus(); // self-heal: the corpus may have been rebuilt or deleted since startup
-      clearFiles();
-      const searchResult = sendCommand('cm_search', {
+      const searchResult = await sendCommand('cm_search', {
         query: args.query,
         context: args?.context,
         limit: args?.limit,
@@ -2408,8 +2295,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const tdtResult = sendCommand('trigger_dilemma_with_targets', {
+      const tdtResult = await sendCommand('trigger_dilemma_with_targets', {
         dilemma_key: args.dilemma_key,
         faction_cqi: args?.faction_cqi,
         target_faction_cqi: args?.target_faction_cqi,
@@ -2426,8 +2312,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isWh3Running()) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
       }
-      clearFiles();
-      const evalResult = sendCommand('eval', { code: args.code }, args?.timeout_ms ?? 30000);
+      const evalResult = await sendCommand('eval', { code: args.code }, args?.timeout_ms ?? 30000);
       return { content: [{ type: 'text', text: JSON.stringify(evalResult, null, 2) }] };
     }
 
@@ -2445,8 +2330,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      clearFiles();
-      const result = sendCommand(cmd, params, timeout);
+      const result = await sendCommand(cmd, params, timeout);
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       };

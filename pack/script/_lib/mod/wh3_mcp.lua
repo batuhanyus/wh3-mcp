@@ -12,6 +12,10 @@
 
 local COMMAND_FILE = "wh3_mcp_command.json"
 local RESULT_FILE = "wh3_mcp_result.json"
+local PROTOCOL_VERSION = 2
+local SCRIPT_VERSION = "2.0.0"
+local SESSION_STATE_FILE = "wh3_mcp_session_v2.json"
+local DEDUPE_LIMIT = 64
 -- Docs corpus for cm_search. Lives in the game root (NOT the pack) so it can
 -- be updated without an RPFM rebuild; the MCP server deploys it on startup.
 local DOCS_FILE = "wh3_mcp_docs.tsv"
@@ -335,6 +339,251 @@ local function poll_context_details()
     return "context=" .. poll_context_name() ..
            " core_present=" .. tostring(core ~= nil) ..
            " cm_present=" .. tostring(cm ~= nil)
+end
+
+-- ---------------------------------------------------------------------------
+-- Protocol v2 runtime state
+-- ---------------------------------------------------------------------------
+
+local raw_write_file = write_file
+local runtime_global = _G
+local instance_token = "lua-" .. tostring(os.time()) .. "-" .. tostring(math.floor(os.clock() * 1000000)) ..
+                       "-" .. tostring({}):gsub("table: ", "")
+local existing_runtime = runtime_global and rawget(runtime_global, "__wh3_mcp_runtime_v2") or nil
+local is_primary_instance = type(existing_runtime) ~= "table"
+local runtime
+
+if is_primary_instance then
+    runtime = {
+        instance = instance_token,
+        script_version = SCRIPT_VERSION,
+        protocol = PROTOCOL_VERSION,
+        context = poll_context_name(),
+        ready = false,
+        callback_registered = false,
+        callback_owner = nil,
+        callback_owner_kind = nil,
+        callback_owner_context = nil,
+        session_id = nil,
+        session_started_at_ms = 0,
+        last_request_id = 0,
+        active_request = nil,
+        reply_cache = {},
+        reply_order = {},
+        publish_counter = 0,
+        context_reloaded = false,
+        secondary_loads = 0,
+    }
+    if runtime_global then rawset(runtime_global, "__wh3_mcp_runtime_v2", runtime) end
+else
+    runtime = existing_runtime
+    runtime.secondary_loads = (tonumber(runtime.secondary_loads) or 0) + 1
+end
+
+local function protocol_error(code, message, details)
+    local out = { code = code, message = tostring(message or code) }
+    if details ~= nil then out.details = details end
+    return out
+end
+
+local function protocol_reply(req, status, payload)
+    local reply = {
+        protocol = PROTOCOL_VERSION,
+        session_id = req.session_id,
+        request_id = req.request_id,
+        status = status,
+    }
+    if status == "ok" then
+        reply.result = payload
+    else
+        reply.error = payload
+    end
+    return reply
+end
+
+local function cache_reply(reply, encoded)
+    if not runtime or type(reply) ~= "table" or type(reply.request_id) ~= "number" then return end
+    local key = tostring(reply.request_id)
+    if runtime.reply_cache[key] == nil then
+        runtime.reply_order[#runtime.reply_order + 1] = key
+    end
+    runtime.reply_cache[key] = encoded
+    while #runtime.reply_order > DEDUPE_LIMIT do
+        local old = table.remove(runtime.reply_order, 1)
+        runtime.reply_cache[old] = nil
+    end
+end
+
+local function atomic_write_raw(filename, content, tag)
+    runtime.publish_counter = (tonumber(runtime.publish_counter) or 0) + 1
+    local safe_tag = tostring(tag or runtime.publish_counter):gsub("[^%w%._%-]", "_")
+    local temp = filename .. ".tmp-" .. safe_tag .. "-" .. tostring(runtime.publish_counter)
+    local ok, err = raw_write_file(temp, content)
+    if not ok then return false, "temp_write_failed:" .. tostring(err) end
+
+    local existing = read_file(filename)
+    if existing then
+        local stale = filename .. ".stale-" .. tostring(os.time()) .. "-" .. tostring(runtime.publish_counter)
+        local moved, move_err = os.rename(filename, stale)
+        if not moved then
+            os.remove(temp)
+            return false, "existing_target_quarantine_failed:" .. tostring(move_err)
+        end
+    end
+
+    local renamed, rename_err = os.rename(temp, filename)
+    if not renamed then
+        os.remove(temp)
+        return false, "rename_failed:" .. tostring(rename_err)
+    end
+    return true
+end
+
+local function quarantine_protocol_file(filename, reason)
+    local suffix = tostring(reason or "invalid"):gsub("[^%w%._%-]", "_")
+    runtime.publish_counter = (tonumber(runtime.publish_counter) or 0) + 1
+    local target = filename .. "." .. suffix .. "-" .. tostring(os.time()) .. "-" .. tostring(runtime.publish_counter)
+    local ok, err = os.rename(filename, target)
+    if ok then return true, target end
+    return false, err
+end
+
+local function persist_session_ledger()
+    if not runtime.session_id then return true end
+    local encoded = json.encode({
+        protocol = PROTOCOL_VERSION,
+        session_id = runtime.session_id,
+        session_started_at_ms = tonumber(runtime.session_started_at_ms) or 0,
+        last_request_id = tonumber(runtime.last_request_id) or 0,
+    })
+    return atomic_write_raw(SESSION_STATE_FILE, encoded, "ledger")
+end
+
+local function load_session_ledger()
+    local content = read_file(SESSION_STATE_FILE)
+    if not content then return end
+    local ok, state = pcall(json.decode, content)
+    if ok and type(state) == "table" and state.protocol == PROTOCOL_VERSION and
+       type(state.session_id) == "string" and state.session_id ~= "" and
+       type(state.last_request_id) == "number" then
+        runtime.session_id = state.session_id
+        runtime.session_started_at_ms = tonumber(state.session_started_at_ms) or 0
+        runtime.last_request_id = math.max(0, math.floor(state.last_request_id))
+        runtime.context_reloaded = true
+    end
+end
+
+if is_primary_instance then load_session_ledger() end
+
+local function validate_request_envelope(command)
+    if type(command) ~= "table" then
+        return false, "INVALID_REQUEST", "request must be a JSON object"
+    end
+    if command.protocol ~= PROTOCOL_VERSION then
+        return false, "PROTOCOL_MISMATCH", "request.protocol must be 2"
+    end
+    if type(command.session_id) ~= "string" or command.session_id == "" then
+        return false, "INVALID_REQUEST", "request.session_id must be a non-empty string"
+    end
+    if type(command.request_id) ~= "number" or command.request_id < 1 or command.request_id ~= math.floor(command.request_id) then
+        return false, "INVALID_REQUEST", "request.request_id must be a positive integer"
+    end
+    if type(command.command) ~= "string" or command.command == "" then
+        return false, "INVALID_REQUEST", "request.command must be a non-empty string"
+    end
+    if type(command.params) ~= "table" then
+        return false, "INVALID_REQUEST", "request.params must be an object"
+    end
+    return true
+end
+
+local function normalize_legacy_result(req, legacy)
+    if type(legacy) ~= "table" then
+        return protocol_reply(req, "error", protocol_error("COMMAND_FAILED", "command returned a non-table result"))
+    end
+    if legacy.protocol == PROTOCOL_VERSION and legacy.session_id and legacy.request_id then
+        return legacy
+    end
+    if legacy.status == "ok" then
+        return protocol_reply(req, "ok", legacy.result)
+    end
+    local text = legacy.error
+    if type(text) == "table" and text.code and text.message then
+        return protocol_reply(req, "error", text)
+    end
+    local code = (legacy.status == "timeout" or tostring(text):find("timeout")) and "COMMAND_TIMEOUT" or "COMMAND_FAILED"
+    return protocol_reply(req, "error", protocol_error(code, tostring(text or "command failed")))
+end
+
+local function publish_protocol_reply(reply)
+    local ok_encode, encoded = pcall(json.encode, reply)
+    if not ok_encode then return false, "encode_failed:" .. tostring(encoded) end
+    local ok_write, err = atomic_write_raw(RESULT_FILE, encoded, tostring(reply.session_id) .. "-" .. tostring(reply.request_id))
+    if ok_write then cache_reply(reply, encoded) end
+    return ok_write, err
+end
+
+-- Intercept every existing RESULT_FILE write in this script. Legacy command
+-- handlers can keep returning {status,result/error}; the transport wrapper
+-- adds protocol/session/request identity and publishes atomically.
+write_file = function(filename, content)
+    if filename ~= RESULT_FILE then
+        return raw_write_file(filename, content)
+    end
+    if not runtime or type(runtime.active_request) ~= "table" then
+        debug_log("result_publish_refused reason=no_active_request")
+        return false, "no_active_request"
+    end
+    local ok_decode, legacy = pcall(json.decode, content)
+    if not ok_decode or type(legacy) ~= "table" then
+        legacy = { status = "error", error = "result JSON encode/decode failure" }
+    end
+    local reply = normalize_legacy_result(runtime.active_request, legacy)
+    local ok_write, err = publish_protocol_reply(reply)
+    if ok_write then runtime.active_request = nil end
+    return ok_write, err
+end
+
+local function publish_error_for_request(req, code, message, details)
+    runtime.active_request = req
+    local ok, err = publish_protocol_reply(protocol_reply(req, "error", protocol_error(code, message, details)))
+    runtime.active_request = nil
+    return ok, err
+end
+
+local function replay_cached_response(request_id)
+    local encoded = runtime.reply_cache[tostring(request_id)]
+    if not encoded then return false end
+    local ok, err = atomic_write_raw(RESULT_FILE, encoded, "replay-" .. tostring(request_id))
+    if not ok then debug_log("reply_replay_failed request=" .. tostring(request_id) .. " error=" .. tostring(err)) end
+    return ok
+end
+
+local function accept_request(req)
+    local previous = tonumber(runtime.last_request_id) or 0
+    runtime.last_request_id = req.request_id
+    local ok, err = persist_session_ledger()
+    if not ok then
+        runtime.last_request_id = previous
+        return false, err
+    end
+    runtime.active_request = req
+    return true
+end
+
+local function restore_active_request(data)
+    if type(data) ~= "table" then return false end
+    if data.protocol ~= PROTOCOL_VERSION or type(data.session_id) ~= "string" or type(data.request_id) ~= "number" then
+        return false
+    end
+    runtime.active_request = {
+        protocol = PROTOCOL_VERSION,
+        session_id = data.session_id,
+        request_id = data.request_id,
+        command = tostring(data.command or "context_transition"),
+        params = type(data.params) == "table" and data.params or {},
+    }
+    return true
 end
 
 local function get_local_faction()
@@ -4309,7 +4558,15 @@ local function handle_quit_tick()
             local clicked = click_dialog_button(box, "confirm")
             debug_log("quit: result written, confirmed exit to windows via " .. tostring(clicked))
         else
-            write_file(QUIT_MARKER, json.encode({ command = "quit_to_menu", dialog = text }))
+            local active = runtime.active_request or {}
+            write_file(QUIT_MARKER, json.encode({
+                protocol = PROTOCOL_VERSION,
+                session_id = active.session_id,
+                request_id = active.request_id,
+                command = "quit_to_menu",
+                params = active.params or {},
+                dialog = text,
+            }))
             local clicked = click_dialog_button(box, "confirm")
             if clicked then
                 debug_log("quit: confirmed exit to main menu via " .. clicked)
@@ -5130,97 +5387,185 @@ local function poll_body()
         end
     end
 
-    local content, err = read_file(COMMAND_FILE)
+    local content, read_err = read_file(COMMAND_FILE)
     if not content then
         return
     end
 
-    debug_log("Command file found, processing")
+    -- Atomic Node publication means a visible command file should be complete.
+    -- If it is not valid JSON, preserve it for diagnostics and never execute it.
+    local ok_decode, command = pcall(json.decode, content)
+    if not ok_decode or type(command) ~= "table" then
+        debug_log("command_rejected reason=malformed_json len=" .. tostring(#tostring(content)))
+        local moved = quarantine_protocol_file(COMMAND_FILE, "invalid-json")
+        if not moved then delete_file(COMMAND_FILE) end
+        return
+    end
 
-    -- Parse the command
-    local ok, command = pcall(json.decode, content)
-    if not ok or not command then
-        -- Log the raw content: an empty read (write race) and a corrupted
-        -- decode look identical without it.
-        debug_log("Failed to parse JSON: ok=" .. tostring(ok) .. " err=" .. tostring(err) ..
-                  " len=" .. tostring(#tostring(content)) ..
-                  " content=[" .. tostring(content):sub(1, 200) .. "]")
-        local error_result = json.encode({ status = "error", error = "failed to parse command JSON: " .. tostring(err) })
-        write_file(RESULT_FILE, error_result)
+    local valid, validation_code, validation_message = validate_request_envelope(command)
+    if not valid then
+        debug_log("command_rejected reason=" .. tostring(validation_code))
+        local has_identity = type(command.session_id) == "string" and command.session_id ~= "" and
+                             type(command.request_id) == "number" and command.request_id >= 1 and
+                             command.request_id == math.floor(command.request_id)
+        if has_identity then
+            publish_error_for_request(command, validation_code, validation_message)
+            delete_file(COMMAND_FILE)
+        else
+            local moved = quarantine_protocol_file(COMMAND_FILE, "invalid-envelope")
+            if not moved then delete_file(COMMAND_FILE) end
+        end
+        return
+    end
+
+    -- Handshake is the only operation allowed to adopt a new Node session.
+    if command.command == "__handshake" then
+        if not runtime.callback_registered then
+            publish_error_for_request(command, "UNSUPPORTED_CAPABILITY",
+                "polling backend is not registered in this Lua context",
+                { context = poll_context_name(), instance = runtime.instance })
+            delete_file(COMMAND_FILE)
+            return
+        end
+        if runtime.session_id ~= command.session_id then
+            local incoming_started = tonumber(command.params.server_started_at_ms) or 0
+            local active_started = tonumber(runtime.session_started_at_ms) or 0
+            if runtime.session_id ~= nil and incoming_started > 0 and active_started > 0 and incoming_started <= active_started then
+                publish_error_for_request(command, "STALE_RESPONSE",
+                    "handshake belongs to an older server session",
+                    { active_session = runtime.session_id, active_started_at_ms = active_started, incoming_started_at_ms = incoming_started })
+                delete_file(COMMAND_FILE)
+                return
+            end
+            runtime.session_id = command.session_id
+            runtime.session_started_at_ms = incoming_started
+            runtime.last_request_id = 0
+            runtime.reply_cache = {}
+            runtime.reply_order = {}
+            runtime.ready = false
+            runtime.context_reloaded = false
+        elseif replay_cached_response(command.request_id) then
+            delete_file(COMMAND_FILE)
+            return
+        elseif command.request_id <= (tonumber(runtime.last_request_id) or 0) then
+            publish_error_for_request(command, "CONTEXT_CHANGED",
+                "request was already accepted but its cached reply is unavailable after context reload",
+                { outcome = "unknown", last_request_id = runtime.last_request_id })
+            delete_file(COMMAND_FILE)
+            return
+        end
+
+        local accepted, ledger_err = accept_request(command)
+        if not accepted then
+            publish_error_for_request(command, "IO_FAILURE", "failed to persist handshake acceptance",
+                { cause = tostring(ledger_err) })
+            delete_file(COMMAND_FILE)
+            return
+        end
+
+        runtime.ready = true
+        runtime.context = poll_context_name()
+        local reply = protocol_reply(command, "ok", {
+            ready = true,
+            protocol = PROTOCOL_VERSION,
+            instance = runtime.instance,
+            context = runtime.context,
+            script_version = SCRIPT_VERSION,
+        })
+        local wrote, write_err = publish_protocol_reply(reply)
+        runtime.active_request = nil
+        if not wrote then
+            debug_log("handshake_reply_failed error=" .. tostring(write_err))
+            runtime.ready = false
+        end
         delete_file(COMMAND_FILE)
         return
     end
 
-    debug_log("Command parsed: " .. tostring(command.command))
+    -- A newly loaded Lua context is deliberately not ready until the server
+    -- proves it is still the active peer with a handshake.
+    if runtime.session_id ~= command.session_id then
+        publish_error_for_request(command, "STALE_RESPONSE",
+            "request session is not the active server session",
+            { active_session = runtime.session_id })
+        delete_file(COMMAND_FILE)
+        return
+    end
+    if not runtime.ready then
+        publish_error_for_request(command, "NOT_READY",
+            "Lua context requires a protocol v2 handshake before command dispatch",
+            { instance = runtime.instance, context = poll_context_name() })
+        delete_file(COMMAND_FILE)
+        return
+    end
 
-    -- Execute
-    local ok, result = pcall(execute_command, command)
-    if not ok then
-        debug_log("Command execution error: " .. tostring(result))
+    if replay_cached_response(command.request_id) then
+        delete_file(COMMAND_FILE)
+        return
+    end
+    if command.request_id <= (tonumber(runtime.last_request_id) or 0) then
+        publish_error_for_request(command, "CONTEXT_CHANGED",
+            "request ID was already accepted; reply replay is no longer available",
+            { outcome = "unknown", last_request_id = runtime.last_request_id })
+        delete_file(COMMAND_FILE)
+        return
+    end
+
+    local accepted, ledger_err = accept_request(command)
+    if not accepted then
+        publish_error_for_request(command, "IO_FAILURE", "failed to persist request acceptance",
+            { cause = tostring(ledger_err) })
+        delete_file(COMMAND_FILE)
+        return
+    end
+
+    debug_log("command_accept request=" .. tostring(command.request_id) .. " command=" .. tostring(command.command))
+
+    local ok_execute, result = pcall(execute_command, command)
+    if not ok_execute then
+        debug_log("command_execution_error request=" .. tostring(command.request_id) .. " error=" .. tostring(result))
         result = { status = "error", error = tostring(result) }
     end
 
-    -- If result is nil, the command deferred its response (start_campaign waiting for load)
+    -- A nil result means an existing state machine owns the eventual reply.
+    -- The accepted identity stays in runtime.active_request and, for context
+    -- transitions, is copied into the marker below.
     if result == nil then
-        debug_log("Command deferred (pending): " .. tostring(command.command))
-        -- Quit sequences own QUIT_MARKER and write it themselves once the
-        -- confirmation is accepted. Writing the campaign-start marker here would
-        -- make the next script instance report a failed campaign start. The
-        -- autoresolve and diplomacy sequences never leave the campaign context,
-        -- so they need no marker either. Same for the move_options and
-        -- research machines - a stale marker from one of those made the next
-        -- boot report "campaign start failed" (hit live 2026-08-22).
         if not quit_pending and not autoresolve_pending and not diplomacy_pending
            and not moveopts_pending and not research_pending then
-            -- Write marker with params so the next script instance knows what was attempted
             local marker_data = json.encode({
+                protocol = PROTOCOL_VERSION,
+                session_id = command.session_id,
+                request_id = command.request_id,
                 command = command.command,
                 params = command.params,
                 is_new_game = campaign_start_params.is_new_game,
             })
             write_file(CAMPAIGN_START_MARKER, marker_data)
         end
-        -- Delete command file so it's not re-read on reload
         delete_file(COMMAND_FILE)
         return
     end
 
-    local ok2, result_json = pcall(json.encode, result)
-    if not ok2 then
-        debug_log("JSON encode error: " .. tostring(result_json))
-        result_json = '{"status":"error","error":"json encode failed"}'
+    local ok_encode, result_json = pcall(json.encode, result)
+    if not ok_encode then
+        result_json = json.encode({ status = "error", error = "json encode failed" })
     end
 
-    -- Write result
-    local ok3 = write_file(RESULT_FILE, result_json)
-    if not ok3 then
-        debug_log("Failed to write result file")
+    local wrote, write_err = write_file(RESULT_FILE, result_json)
+    if not wrote then
+        debug_log("result_publish_failed request=" .. tostring(command.request_id) .. " error=" .. tostring(write_err))
     end
-
-    -- Delete command file to signal it was processed
     delete_file(COMMAND_FILE)
-    debug_log("Command processed: " .. tostring(command.command))
 end
 
 -- Timer managers stop invoking a callback when it raises. Keep the existing
 -- poll body and protocol unchanged, but contain and record unexpected errors.
 local function poll()
     poll_invocation_count = poll_invocation_count + 1
-    local now = os.clock()
-    if poll_invocation_count <= 3 then
-        poll_diagnostic("poll_invocation #" .. poll_invocation_count ..
-                        " " .. poll_context_details())
-    elseif now - poll_last_heartbeat >= 10 then
-        poll_last_heartbeat = now
-        poll_diagnostic("poll_heartbeat #" .. poll_invocation_count ..
-                        " " .. poll_context_details())
-    end
-
     local body_ok, body_err = pcall(poll_body)
     if not body_ok then
-        poll_diagnostic("poll_exception #" .. poll_invocation_count ..
-                        " " .. poll_context_details() .. " error=" .. tostring(body_err))
-        debug_log("Polling callback exception: " .. tostring(body_err))
+        debug_log("poll_exception context=" .. poll_context_name() .. " error=" .. tostring(body_err))
     end
 end
 
@@ -5229,156 +5574,172 @@ end
 -- ---------------------------------------------------------------------------
 debug_log("Script loaded from _lib/mod")
 
-local poll_registered = false
-local poll_owner = nil
-local poll_owner_kind = nil
-local poll_owner_context = nil
+local function has_method(object, method_name)
+    if object == nil then return false end
+    local ok, value = pcall(function() return object[method_name] end)
+    return ok and type(value) == "function"
+end
 
-local function remove_poll_registration(owner, kind, context, reason)
+local function remove_owned_poll_registration(reason)
+    if not runtime.callback_registered then return true end
+    local owner = runtime.callback_owner
+    if not owner or not has_method(owner, "remove_real_callback") then
+        return false, "remove_callback_unsupported"
+    end
     local ok, err = pcall(function()
         owner:remove_real_callback(POLL_CALLBACK_NAME)
     end)
-    poll_diagnostic("timer_remove manager=" .. kind .. " context=" .. context ..
-                    " reason=" .. reason .. " ok=" .. tostring(ok) ..
-                    (not ok and " error=" .. tostring(err) or ""))
-    return ok
+    if not ok then return false, "remove_callback_failed:" .. tostring(err) end
+    runtime.callback_registered = false
+    runtime.callback_owner = nil
+    runtime.callback_owner_kind = nil
+    runtime.callback_owner_context = nil
+    return true
+end
+
+local function resolve_poll_manager(context)
+    local core_reason = nil
+    if core ~= nil and has_method(core, "get_tm") then
+        local lookup_ok, timer_manager = pcall(function() return core:get_tm() end)
+        if not lookup_ok then
+            core_reason = "core_get_tm_threw"
+        elseif timer_manager == nil then
+            core_reason = "core_get_tm_nil"
+        elseif not has_method(timer_manager, "repeat_real_callback") then
+            core_reason = "core_timer_missing_repeat"
+        else
+            return timer_manager, "core_timer_manager", nil
+        end
+    elseif core == nil then
+        core_reason = "core_missing"
+    else
+        core_reason = "core_get_tm_missing"
+    end
+
+    if context == "campaign" and cm ~= nil and has_method(cm, "repeat_real_callback") then
+        return cm, "campaign_manager", core_reason
+    end
+
+    return nil, nil, core_reason or ((context == "campaign") and "campaign_timer_missing_repeat" or "no_timer_backend")
 end
 
 local function start_poll_loop(force)
     local context = poll_context_name()
-    if poll_registered and poll_owner_context == context and not force then
-        poll_diagnostic("timer_registration_skipped manager=" .. tostring(poll_owner_kind) ..
-                        " context=" .. context .. " reason=already_registered")
-        return true
+    runtime.context = context
+
+    if runtime.callback_registered and runtime.callback_owner_context == context and not force then
+        return true, runtime.callback_owner_kind, nil
     end
 
-    local manager = nil
-    local manager_kind = nil
-    if context == "campaign" and cm then
-        manager = cm
-        manager_kind = "campaign_manager"
-    elseif context == "campaign" then
-        poll_diagnostic("campaign_manager_unavailable " .. poll_context_details())
+    if runtime.callback_registered and force then
+        local removed, remove_reason = remove_owned_poll_registration("controlled_rebind")
+        if not removed then return false, nil, remove_reason end
+    elseif runtime.callback_registered and runtime.callback_owner_context ~= context then
+        local removed, remove_reason = remove_owned_poll_registration("context_change")
+        if not removed then return false, nil, remove_reason end
     end
 
-    if not manager and core then
-        local lookup_ok, timer_manager = pcall(function()
-            return core:get_tm()
-        end)
-        if lookup_ok and timer_manager then
-            manager = timer_manager
-            manager_kind = "core_timer_manager"
-        else
-            poll_diagnostic("timer_manager_lookup_failed " .. poll_context_details() ..
-                            " error=" .. tostring(timer_manager))
-        end
-    end
-
+    local manager, manager_kind, lookup_reason = resolve_poll_manager(context)
     if not manager then
-        poll_diagnostic("timer_registration_failed context=" .. context ..
-                        " reason=no_manager " .. poll_context_details())
-        return false
+        return false, nil, lookup_reason or "no_supported_timer"
     end
 
-    if poll_registered and poll_owner ~= manager then
-        local previous_removed = remove_poll_registration(
-            poll_owner, poll_owner_kind, poll_owner_context, "manager_change")
-        if not previous_removed then
-            if poll_owner_context == context then
-                poll_diagnostic("timer_registration_failed context=" .. context ..
-                                " reason=active_manager_cleanup_failed")
-                return false
-            end
-            poll_diagnostic("timer_previous_context_cleanup_failed previous_context=" ..
-                            tostring(poll_owner_context) .. " context=" .. context)
-        end
-    end
-
-    if not remove_poll_registration(manager, manager_kind, context, "pre_register") then
-        poll_diagnostic("timer_registration_failed manager=" .. manager_kind ..
-                        " context=" .. context .. " reason=callback_cleanup_failed")
-        return false
-    end
-
-    poll_diagnostic("timer_registration_attempt manager=" .. manager_kind ..
-                    " context=" .. context .. " interval_ms=" .. POLL_INTERVAL ..
-                    " force=" .. tostring(force == true))
     local ok, err = pcall(function()
         manager:repeat_real_callback(poll, POLL_INTERVAL, POLL_CALLBACK_NAME)
     end)
     if not ok then
-        poll_registered = false
-        poll_owner = nil
-        poll_owner_kind = nil
-        poll_owner_context = nil
-        poll_diagnostic("timer_registration_failure manager=" .. manager_kind ..
-                        " context=" .. context .. " interval_ms=" .. POLL_INTERVAL ..
-                        " error=" .. tostring(err))
-        debug_log("Poll timer registration failed: " .. tostring(err))
-        return false
+        runtime.callback_registered = false
+        runtime.callback_owner = nil
+        runtime.callback_owner_kind = nil
+        runtime.callback_owner_context = nil
+        return false, manager_kind, "registration_threw:" .. tostring(err)
     end
 
-    poll_registered = true
-    poll_owner = manager
-    poll_owner_kind = manager_kind
-    poll_owner_context = context
-    poll_diagnostic("timer_registered manager=" .. manager_kind ..
-                    " context=" .. context .. " interval_ms=" .. POLL_INTERVAL)
-    debug_log("Poll loop started via " .. manager_kind)
-    return true
+    runtime.callback_registered = true
+    runtime.callback_owner = manager
+    runtime.callback_owner_kind = manager_kind
+    runtime.callback_owner_context = context
+    return true, manager_kind, nil
 end
 
--- A campaign context gets its own Campaign Manager real timer. The named
--- callback is removed before registration, so WorldCreated can safely rebind
--- even if a core timer callback survived the frontend transition.
-poll_diagnostic("initialization " .. poll_context_details() ..
-                " interval_ms=" .. POLL_INTERVAL)
-local listener_ok, listener_err = pcall(function()
-    core:add_listener(
-        "Wh3McpPollCampaignContext",
-        "WorldCreated",
-        true,
-        function()
-            poll_diagnostic("WorldCreated received " .. poll_context_details())
-            if poll_context_name() == "campaign" then
-                start_poll_loop(true)
-            else
-                poll_diagnostic("WorldCreated ignored outside campaign " .. poll_context_details())
-            end
-            pcall(function() core:remove_listener("Wh3McpPollCampaignContext") end)
-        end,
-        false
-    )
-end)
-if not listener_ok then
-    poll_diagnostic("WorldCreated_listener_registration_failure error=" .. tostring(listener_err))
-end
+local startup_registered = false
+local startup_backend = "none"
+local startup_failure_reason = nil
 
--- Try starting immediately. In a campaign, prefer the campaign-scoped API;
--- otherwise use the context's core timer manager.
-if not start_poll_loop(false) then
-    poll_diagnostic("timer_not_ready retrying_on_UICreated " .. poll_context_details())
-    local retry_ok, retry_err = pcall(function()
-        core:add_listener(
-            "Wh3McpInit",
-            "UICreated",
-            true,
-            function()
-                poll_diagnostic("UICreated retry " .. poll_context_details())
-                if start_poll_loop(false) then
-                    core:remove_listener("Wh3McpInit")
-                end
-            end,
-            false
-        )
-    end)
-    if not retry_ok then
-        poll_diagnostic("UICreated_listener_registration_failure error=" .. tostring(retry_err))
+if not is_primary_instance then
+    startup_failure_reason = "secondary_copy_suppressed"
+    startup_backend = tostring(runtime.callback_owner_kind or "existing")
+    startup_registered = runtime.callback_registered and true or false
+else
+    local ok_start, backend, reason = start_poll_loop(false)
+    startup_registered = ok_start and true or false
+    startup_backend = tostring(backend or "none")
+    startup_failure_reason = reason
+
+    -- Context transitions normally reload this file, but WorldCreated/UICreated
+    -- retries cover engines that expose a supported timer slightly later.
+    if core ~= nil and has_method(core, "add_listener") then
+        pcall(function()
+            core:add_listener(
+                "Wh3McpPollCampaignContext",
+                "WorldCreated",
+                true,
+                function()
+                    if is_primary_instance and poll_context_name() == "campaign" then
+                        local rebound, _, rebound_reason = start_poll_loop(true)
+                        if not rebound then
+                            debug_log("poll_rebind_failed reason=" .. tostring(rebound_reason))
+                        end
+                    end
+                    if has_method(core, "remove_listener") then
+                        pcall(function() core:remove_listener("Wh3McpPollCampaignContext") end)
+                    end
+                end,
+                false
+            )
+        end)
+
+        if not startup_registered then
+            pcall(function()
+                core:add_listener(
+                    "Wh3McpInit",
+                    "UICreated",
+                    true,
+                    function()
+                        if not is_primary_instance then return end
+                        local retry_ok, _, retry_reason = start_poll_loop(false)
+                        if retry_ok then
+                            if has_method(core, "remove_listener") then
+                                pcall(function() core:remove_listener("Wh3McpInit") end)
+                            end
+                        else
+                            debug_log("poll_retry_failed reason=" .. tostring(retry_reason))
+                        end
+                    end,
+                    false
+                )
+            end)
+        end
     end
+end
+
+local startup_summary = "poll_backend=" .. tostring(startup_backend) ..
+                        " instance=" .. tostring(runtime.instance) ..
+                        " context=" .. tostring(poll_context_name()) ..
+                        " protocol=" .. tostring(PROTOCOL_VERSION) ..
+                        " registered=" .. tostring(startup_registered)
+if startup_failure_reason then
+    startup_summary = startup_summary .. " failure_reason=" .. tostring(startup_failure_reason)
+end
+if is_primary_instance then
+    poll_diagnostic(startup_summary)
+    debug_log(startup_summary)
+else
+    debug_log("secondary_copy_suppressed instance=" .. tostring(runtime.instance))
 end
 
 -- Step 3: If we're in a campaign, check if we need to fulfill a pending campaign start
-if in_campaign() then
+if is_primary_instance and in_campaign() then
     debug_log("Campaign detected, cm functions available")
     -- If there's a result file already, the campaign loaded before our poll loop started
     -- (e.g., this is a reload due to campaign load). Don't overwrite it.
@@ -5402,24 +5763,29 @@ end
 local function check_quit_transition()
     local marker = io.open(QUIT_MARKER, "r")
     if not marker then return false end
+    local marker_content = marker:read("*a")
     marker:close()
     delete_file(QUIT_MARKER)
+
+    local ok_marker, marker_data = pcall(json.decode, marker_content)
+    if not ok_marker or not restore_active_request(marker_data) then
+        debug_log("quit_transition_marker_invalid")
+        return true
+    end
 
     local result_file = io.open(RESULT_FILE, "r")
     if result_file then
         result_file:close()
-        debug_log("Quit marker found but a result already exists")
+        debug_log("quit_transition_result_already_present")
         return true
     end
 
     if in_campaign() then
-        debug_log("Quit marker found but still in a campaign — writing failure result")
         write_file(RESULT_FILE, json.encode({
             status = "error",
             error = "quit_to_menu: script reloaded but still in a campaign",
         }))
     else
-        debug_log("Quit marker found and out of campaign — writing success result")
         write_file(RESULT_FILE, json.encode({
             status = "ok",
             result = { quit = true, in_campaign = false, method = "reload_detected" },
@@ -5445,10 +5811,13 @@ local function check_context_transition()
     local ok, marker_data = pcall(json.decode, marker_content)
     if ok and type(marker_data) == "table" then
         is_new_game = marker_data.is_new_game or false
-        debug_log("Marker data: " .. tostring(marker_content))
+        if not restore_active_request(marker_data) then
+            debug_log("campaign_transition_marker_missing_protocol_identity")
+            return
+        end
     else
-        -- Legacy marker (just "1")
-        debug_log("Legacy marker, defaulting is_new_game=false")
+        debug_log("campaign_transition_marker_invalid")
+        return
     end
 
     -- Check if a result already exists (server may have already been satisfied)
@@ -5488,4 +5857,4 @@ local function check_context_transition()
         write_file(RESULT_FILE, result)
     end
 end
-check_context_transition()
+if is_primary_instance then check_context_transition() end
