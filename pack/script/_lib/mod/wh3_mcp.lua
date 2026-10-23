@@ -8,7 +8,7 @@
 --
 -- This script must be at script/_lib/mod/wh3_mcp.lua in the pack.
 -- It loads automatically at game startup (main menu AND campaigns).
--- Uses core:get_tm():repeat_real_callback() for polling (works everywhere).
+-- Uses core:get_tm() in frontend/battle and cm:repeat_real_callback() in campaign.
 
 local COMMAND_FILE = "wh3_mcp_command.json"
 local RESULT_FILE = "wh3_mcp_result.json"
@@ -17,6 +17,9 @@ local RESULT_FILE = "wh3_mcp_result.json"
 local DOCS_FILE = "wh3_mcp_docs.tsv"
 local POLL_INTERVAL = 1000  -- milliseconds between polls
 local DEBUG_LOG = "wh3_mcp_debug.log"
+-- Absolute path verified from wh3_status; deliberately independent of cwd.
+local POLL_DIAGNOSTIC_LOG = "D:\\Program Files (x86)\\Steam\\steamapps\\common\\Total War WARHAMMER III\\wh3_mcp_poll_diagnostic.log"
+local POLL_CALLBACK_NAME = "wh3_mcp_poll"
 local CAMPAIGN_START_MARKER = "wh3_mcp_starting_campaign.marker"
 local QUIT_MARKER = "wh3_mcp_quitting.marker"
 
@@ -27,7 +30,8 @@ local campaign_start_time = 0
 local CAMPAIGN_START_TIMEOUT = 120.0  -- seconds to wait for campaign load
 local continue_wait_start = 0          -- when we first detected in_campaign (for Continue button wait)
 local CONTINUE_BUTTON_TIMEOUT = 60.0   -- seconds to wait for Continue button after campaign detected
-local heartbeat_count = 0
+local poll_invocation_count = 0
+local poll_last_heartbeat = os.clock()
 
 -- Quit / exit state machine (campaign -> main menu, or campaign -> desktop)
 local quit_pending = false   -- true while a quit_to_menu / exit_to_windows sequence runs
@@ -128,6 +132,19 @@ debug_log = function(msg)
             file:close()
         end
     end)
+end
+-- Poll diagnostics use an absolute game-root path so a changed process cwd
+-- cannot hide timer failures or callback exceptions.
+local function poll_diagnostic(msg)
+    local ok, err = pcall(function()
+        local file, open_err = io.open(POLL_DIAGNOSTIC_LOG, "a")
+        if not file then error("open failed: " .. tostring(open_err)) end
+        file:write(os.date("%Y-%m-%d %H:%M:%S") .. " [wh3-mcp-poll] " .. tostring(msg) .. "\n")
+        file:close()
+    end)
+    if not ok then
+        debug_log("Poll diagnostic write failed: " .. tostring(err))
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -304,6 +321,20 @@ end
 -- case the context reads as frontend until it appears.
 local function in_battle()
     return (core and core:is_battle() and bm ~= nil) and true or false
+end
+
+local function poll_context_name()
+    local ok, campaign = pcall(in_campaign)
+    if ok and campaign then return "campaign" end
+    local ok_battle, battle = pcall(in_battle)
+    if ok_battle and battle then return "battle" end
+    return "frontend"
+end
+
+local function poll_context_details()
+    return "context=" .. poll_context_name() ..
+           " core_present=" .. tostring(core ~= nil) ..
+           " cm_present=" .. tostring(cm ~= nil)
 end
 
 local function get_local_faction()
@@ -4836,13 +4867,7 @@ local function handle_autofight_tick()
     end
 end
 
-local function poll()
-    -- Heartbeat every 30 ticks to confirm poll loop is alive
-    heartbeat_count = heartbeat_count + 1
-    if heartbeat_count % 30 == 0 then
-        debug_log("heartbeat #" .. heartbeat_count .. " pending=" .. tostring(campaign_start_pending) .. " in_campaign=" .. tostring(in_campaign()))
-    end
-
+local function poll_body()
     -- Battle context: hook the phase callbacks once per script instance, and
     -- arm auto_fight if the campaign side left the marker (fight_battle
     -- {auto: true}). battle_hooked resets naturally - every context
@@ -5177,53 +5202,179 @@ local function poll()
     debug_log("Command processed: " .. tostring(command.command))
 end
 
+-- Timer managers stop invoking a callback when it raises. Keep the existing
+-- poll body and protocol unchanged, but contain and record unexpected errors.
+local function poll()
+    poll_invocation_count = poll_invocation_count + 1
+    local now = os.clock()
+    if poll_invocation_count <= 3 then
+        poll_diagnostic("poll_invocation #" .. poll_invocation_count ..
+                        " " .. poll_context_details())
+    elseif now - poll_last_heartbeat >= 10 then
+        poll_last_heartbeat = now
+        poll_diagnostic("poll_heartbeat #" .. poll_invocation_count ..
+                        " " .. poll_context_details())
+    end
+
+    local body_ok, body_err = pcall(poll_body)
+    if not body_ok then
+        poll_diagnostic("poll_exception #" .. poll_invocation_count ..
+                        " " .. poll_context_details() .. " error=" .. tostring(body_err))
+        debug_log("Polling callback exception: " .. tostring(body_err))
+    end
+end
+
 -- ---------------------------------------------------------------------------
 -- Initialisation
 -- ---------------------------------------------------------------------------
-
--- Step 1: Log that the script loaded
 debug_log("Script loaded from _lib/mod")
 
--- Step 2: Start the poll loop
--- core:get_tm() is the game's timer manager, available at main menu AND in campaign.
--- cm:repeat_real_callback() only works during campaigns.
--- If neither is ready at load time, retry via a UICreated listener.
+local poll_registered = false
+local poll_owner = nil
+local poll_owner_kind = nil
+local poll_owner_context = nil
 
-local function start_poll_loop()
-    -- Priority 1: core timer manager (works everywhere)
-    local tm = core:get_tm()
-    if tm then
-        tm:repeat_real_callback(poll, POLL_INTERVAL, "wh3_mcp_poll")
-        debug_log("Poll loop started via core timer manager")
+local function remove_poll_registration(owner, kind, context, reason)
+    local ok, err = pcall(function()
+        owner:remove_real_callback(POLL_CALLBACK_NAME)
+    end)
+    poll_diagnostic("timer_remove manager=" .. kind .. " context=" .. context ..
+                    " reason=" .. reason .. " ok=" .. tostring(ok) ..
+                    (not ok and " error=" .. tostring(err) or ""))
+    return ok
+end
+
+local function start_poll_loop(force)
+    local context = poll_context_name()
+    if poll_registered and poll_owner_context == context and not force then
+        poll_diagnostic("timer_registration_skipped manager=" .. tostring(poll_owner_kind) ..
+                        " context=" .. context .. " reason=already_registered")
         return true
     end
 
-    -- Priority 2: campaign manager (only during campaigns)
-    if cm then
-        local ok, err = pcall(cm.repeat_real_callback, cm, poll, POLL_INTERVAL)
-        if ok then
-            debug_log("Poll loop started via cm:repeat_real_callback")
-            return true
+    local manager = nil
+    local manager_kind = nil
+    if context == "campaign" and cm then
+        manager = cm
+        manager_kind = "campaign_manager"
+    elseif context == "campaign" then
+        poll_diagnostic("campaign_manager_unavailable " .. poll_context_details())
+    end
+
+    if not manager and core then
+        local lookup_ok, timer_manager = pcall(function()
+            return core:get_tm()
+        end)
+        if lookup_ok and timer_manager then
+            manager = timer_manager
+            manager_kind = "core_timer_manager"
+        else
+            poll_diagnostic("timer_manager_lookup_failed " .. poll_context_details() ..
+                            " error=" .. tostring(timer_manager))
         end
     end
 
-    return false
+    if not manager then
+        poll_diagnostic("timer_registration_failed context=" .. context ..
+                        " reason=no_manager " .. poll_context_details())
+        return false
+    end
+
+    if poll_registered and poll_owner ~= manager then
+        local previous_removed = remove_poll_registration(
+            poll_owner, poll_owner_kind, poll_owner_context, "manager_change")
+        if not previous_removed then
+            if poll_owner_context == context then
+                poll_diagnostic("timer_registration_failed context=" .. context ..
+                                " reason=active_manager_cleanup_failed")
+                return false
+            end
+            poll_diagnostic("timer_previous_context_cleanup_failed previous_context=" ..
+                            tostring(poll_owner_context) .. " context=" .. context)
+        end
+    end
+
+    if not remove_poll_registration(manager, manager_kind, context, "pre_register") then
+        poll_diagnostic("timer_registration_failed manager=" .. manager_kind ..
+                        " context=" .. context .. " reason=callback_cleanup_failed")
+        return false
+    end
+
+    poll_diagnostic("timer_registration_attempt manager=" .. manager_kind ..
+                    " context=" .. context .. " interval_ms=" .. POLL_INTERVAL ..
+                    " force=" .. tostring(force == true))
+    local ok, err = pcall(function()
+        manager:repeat_real_callback(poll, POLL_INTERVAL, POLL_CALLBACK_NAME)
+    end)
+    if not ok then
+        poll_registered = false
+        poll_owner = nil
+        poll_owner_kind = nil
+        poll_owner_context = nil
+        poll_diagnostic("timer_registration_failure manager=" .. manager_kind ..
+                        " context=" .. context .. " interval_ms=" .. POLL_INTERVAL ..
+                        " error=" .. tostring(err))
+        debug_log("Poll timer registration failed: " .. tostring(err))
+        return false
+    end
+
+    poll_registered = true
+    poll_owner = manager
+    poll_owner_kind = manager_kind
+    poll_owner_context = context
+    poll_diagnostic("timer_registered manager=" .. manager_kind ..
+                    " context=" .. context .. " interval_ms=" .. POLL_INTERVAL)
+    debug_log("Poll loop started via " .. manager_kind)
+    return true
 end
 
--- Try starting immediately
-if not start_poll_loop() then
-    debug_log("Timer not ready yet, deferring via UICreated listener")
+-- A campaign context gets its own Campaign Manager real timer. The named
+-- callback is removed before registration, so WorldCreated can safely rebind
+-- even if a core timer callback survived the frontend transition.
+poll_diagnostic("initialization " .. poll_context_details() ..
+                " interval_ms=" .. POLL_INTERVAL)
+local listener_ok, listener_err = pcall(function()
     core:add_listener(
-        "Wh3McpInit",
-        "UICreated",
+        "Wh3McpPollCampaignContext",
+        "WorldCreated",
         true,
         function()
-            if start_poll_loop() then
-                core:remove_listener("Wh3McpInit")
+            poll_diagnostic("WorldCreated received " .. poll_context_details())
+            if poll_context_name() == "campaign" then
+                start_poll_loop(true)
+            else
+                poll_diagnostic("WorldCreated ignored outside campaign " .. poll_context_details())
             end
+            pcall(function() core:remove_listener("Wh3McpPollCampaignContext") end)
         end,
         false
     )
+end)
+if not listener_ok then
+    poll_diagnostic("WorldCreated_listener_registration_failure error=" .. tostring(listener_err))
+end
+
+-- Try starting immediately. In a campaign, prefer the campaign-scoped API;
+-- otherwise use the context's core timer manager.
+if not start_poll_loop(false) then
+    poll_diagnostic("timer_not_ready retrying_on_UICreated " .. poll_context_details())
+    local retry_ok, retry_err = pcall(function()
+        core:add_listener(
+            "Wh3McpInit",
+            "UICreated",
+            true,
+            function()
+                poll_diagnostic("UICreated retry " .. poll_context_details())
+                if start_poll_loop(false) then
+                    core:remove_listener("Wh3McpInit")
+                end
+            end,
+            false
+        )
+    end)
+    if not retry_ok then
+        poll_diagnostic("UICreated_listener_registration_failure error=" .. tostring(retry_err))
+    end
 end
 
 -- Step 3: If we're in a campaign, check if we need to fulfill a pending campaign start

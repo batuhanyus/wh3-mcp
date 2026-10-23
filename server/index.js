@@ -34,27 +34,41 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Configuration
 // ---------------------------------------------------------------------------
 
-// Detect WH3 install path from Steam
+// Detect WH3 install path from an explicit override, Steam locations, or registry.
+function hasWh3Executable(installPath) {
+  try {
+    return statSync(join(installPath, 'Warhammer3.exe')).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function findWh3Path() {
+  const configuredPath = process.env.WH3_INSTALL_PATH?.trim();
+  if (configuredPath) return configuredPath;
+
   const candidates = [
+    'D:\\Program Files (x86)\\Steam\\steamapps\\common\\Total War WARHAMMER III',
     'C:\\Program Files (x86)\\Steam\\steamapps\\common\\Total War WARHAMMER III',
     'D:\\SteamLibrary\\steamapps\\common\\Total War WARHAMMER III',
     'E:\\SteamLibrary\\steamapps\\common\\Total War WARHAMMER III',
   ];
   for (const p of candidates) {
-    const exe = join(p, 'Warhammer3.exe');
-    if (existsSync(exe)) return p;
+    if (hasWh3Executable(p)) return p;
   }
-  // Try to find via Steam registry
+  // Try to find via Steam registry; reject stale or empty registry values.
   try {
     const output = execSync(
       'reg query "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 1142710" /v InstallLocation 2>nul',
       { encoding: 'utf8' }
     );
     const match = output.match(/InstallLocation\s+REG_SZ\s+(.+)/);
-    if (match) return match[1].trim();
+    if (match) {
+      const registryPath = match[1].trim();
+      if (registryPath && hasWh3Executable(registryPath)) return registryPath;
+    }
   } catch {}
-  return candidates[0]; // fallback
+  return candidates[0]; // keep an actionable path for executable-not-found errors
 }
 
 const WH3_PATH = findWh3Path();
@@ -106,8 +120,16 @@ function isWh3Running() {
   }
 }
 
-function startWh3() {
+async function startWh3() {
   if (isWh3Running()) return { status: 'already_running', pid: wh3Process?.pid };
+  if (!hasWh3Executable(WH3_PATH)) {
+    return {
+      status: 'executable_not_found',
+      path: WH3_PATH,
+      exe: WH3_EXE,
+      error: 'Warhammer3.exe is missing or is not a file at the selected install path',
+    };
+  }
 
   // WH3 reads user.script.txt from %APPDATA%/The Creative Assembly/Warhammer3/scripts/
   // for mod loading. This file must exist and be read-only to prevent the launcher
@@ -115,19 +137,75 @@ function startWh3() {
   // the mod manager's used_mods.txt.
   // Skip intro videos to speed up testing.
   const args = ['--feature', 'disable_intro_videos'];
+  let child;
+  try {
+    child = spawn(WH3_EXE, args, {
+      detached: false,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      cwd: WH3_PATH,
+    });
+  } catch (err) {
+    return {
+      status: 'launch_error',
+      path: WH3_PATH,
+      exe: WH3_EXE,
+      error_code: err.code ?? null,
+      error: err.message,
+    };
+  }
 
-  wh3Process = spawn(WH3_EXE, args, {
-    detached: false,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    cwd: WH3_PATH,
+  wh3Process = child;
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr = (stderr + chunk.toString()).slice(-8192);
   });
 
-  wh3Process.on('exit', (code) => {
-    console.error(`[wh3-mcp] WH3 exited with code ${code}`);
-    wh3Process = null;
-  });
+  return new Promise((resolve) => {
+    let settled = false;
+    let startupTimer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(startupTimer);
+      resolve(result);
+    };
 
-  return { status: 'started', pid: wh3Process.pid };
+    child.once('spawn', () => {
+      startupTimer = setTimeout(() => {
+        if (child.exitCode === null) {
+          finish({ status: 'started', pid: child.pid, path: WH3_PATH, exe: WH3_EXE });
+        }
+      }, 1500);
+    });
+
+    child.once('error', (err) => {
+      if (wh3Process === child) wh3Process = null;
+      finish({
+        status: err.code === 'ENOENT' ? 'executable_not_found' : 'launch_error',
+        path: WH3_PATH,
+        exe: WH3_EXE,
+        pid: child.pid ?? null,
+        error_code: err.code ?? null,
+        error: err.message,
+        stderr: stderr.trim(),
+      });
+    });
+
+    child.once('close', (code, signal) => {
+      if (wh3Process === child) wh3Process = null;
+      console.error(`[wh3-mcp] WH3 exited with code ${code}${signal ? ` (signal ${signal})` : ''}`);
+      if (stderr.trim()) console.error(`[wh3-mcp] WH3 stderr: ${stderr.trim()}`);
+      finish({
+        status: 'process_exited',
+        path: WH3_PATH,
+        exe: WH3_EXE,
+        pid: child.pid ?? null,
+        exit_code: code,
+        signal,
+        stderr: stderr.trim(),
+      });
+    });
+  });
 }
 
 function stopWh3() {
@@ -1344,7 +1422,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   switch (name) {
     case 'wh3_start': {
-      const result = startWh3();
+      const result = await startWh3();
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       };
@@ -2385,6 +2463,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 async function main() {
   console.error(`[wh3-mcp] WH3 path: ${WH3_PATH}`);
+  console.error(`[wh3-mcp] WH3 executable: ${WH3_EXE}`);
   console.error(`[wh3-mcp] Command file: ${COMMAND_FILE}`);
   console.error(`[wh3-mcp] Result file: ${RESULT_FILE}`);
   deployDocsCorpus();

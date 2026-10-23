@@ -1,109 +1,34 @@
-# WH3-MCP
+# WH3-MCP Batch A: Infrastructure Integrity
 
-Let an AI agent play and test Total War: WARHAMMER III. Built for mod
-developers who want fast iteration: the agent boots the game, loads a save,
-triggers your content, reads what appeared on screen (as text, no vision
-needed), checks for script errors and reports back.
+Target repository: **wh3-mcp** (the 2026-10-23 archive). W&T stays unchanged in Batch A, except that agents may read it as an integration fixture. Copy these task files into the MCP repository, e.g. `tasks/batch-a/`.
 
-This repo is the tooling half. The game-side mod (`wh3_mcp_server.pack`)
-ships on the Steam Workshop; its Lua source is in `pack/` here.
+## Execution order
 
-## How it works
+1. A01 — protocol contract and test harness
+2. A02 — correlated, atomic, serialized transport
+3. A03 — Lua poll lifecycle and duplicate-load safety
+4. A04 — game process, install path, and filesystem safety
+5. A05 — context transitions and crash recovery
+6. A06 — log-offset and diagnostics reliability
+7. A07 — integration gate, packaging, and documentation
 
-The mod polls `wh3_mcp_command.json` in the WH3 install folder once per
-second. Your agent writes a command into that file; the mod executes it (in
-frontend, campaign and battle context) and writes `wh3_mcp_result.json`.
-Two text files, no sockets, no injection. Any script can drive it. The MCP
-server in this repo wraps the protocol in about 80 typed tools for AI models.
+A01 is a prerequisite for all others. A02 and A03 must land before A05. A04 and A06 can be implemented after A01 in parallel branches, but merge only after relevant tests pass. A07 comes last.
 
-## Setup
+## Non-negotiable rules
 
-Requirements: Windows, WH3 on Steam, Node.js 18+.
+- No fake `RUNTIME_VERIFIED` claims. Batch A is **offline-verifiable** with mocks and Node tests. The game-dependent smoke suite is documented and remains pending until actually executed on the Windows/WH3 host.
+- Do not invent WH3 Lua API behaviour. Guard calls and produce explicit diagnostics for unsupported capabilities.
+- Existing public MCP tools and their input/output contracts remain compatible unless a protocol-level breaking change is documented and justified. Avoid adding unrelated gameplay tools or W&T functionality.
+- No live mutation or automatic campaign progression in tests. Use fake game-side responder fixtures; live smoke commands are read-only wherever possible.
+- Keep protocol files in the established WH3 directory unless there is a demonstrated need to relocate them; avoid introducing an HTTP service.
+- `wh3_eval` remains an explicitly powerful diagnostic escape hatch. Do not expand its surface in Batch A.
+- Every task: implement, add focused regression tests, run `npm test` from `server/`, run `node --check server/index.js`, perform Lua syntax checking via repository-supported tooling where available, and report exact commands/results. Never equate Lua syntax checking with game API validation.
+- Keep task changes scoped; avoid a whole-server rewrite. Prefer extracting isolated transport/process modules with injected filesystem/clock/process dependencies for testing.
 
-1. Subscribe to the mod on the Steam Workshop and enable it. Then set
-   `user.script.txt` (in `%APPDATA%\The Creative Assembly\Warhammer3\scripts\`)
-   to read-only so the launcher stops rewriting your mod list.
-2. Install the server:
-   ```
-   git clone https://github.com/PassingByPixels/wh3-mcp
-   cd wh3-mcp/server
-   npm install
-   ```
-3. Register it with your MCP client.
+## Delivery format
 
-   Claude Code:
-   ```
-   claude mcp add wh3 -- node C:\path\to\wh3-mcp\server\index.js
-   ```
-   Claude Desktop or any other MCP client, in its config JSON:
-   ```json
-   { "mcpServers": { "wh3": { "command": "node", "args": ["C:\\path\\to\\wh3-mcp\\server\\index.js"] } } }
-   ```
-4. Done. The server finds your WH3 install by itself (standard Steam paths,
-   then the registry) and deploys the docs corpus for `cm_search` into the
-   game folder on startup. First calls to try: `wh3_start` boots the game,
-   `wh3_ping` confirms the mod is answering.
+For each task provide: changed files, tests added, offline test results, behaviour/compatibility notes, and remaining live-game checks. No untested success declaration. At the end, provide a Batch A evidence checklist, including Windows/WH3 smoke prerequisites.
 
-## Driving it without the MCP server
+## Definition of Batch A done
 
-`tools/send-cmd.ps1` writes a command and waits for the result:
-
-```powershell
-.\tools\send-cmd.ps1 -Json '{"command":"ping","params":{}}'
-.\tools\send-cmd.ps1 -Json '{"command":"load_campaign","params":{"filename":"my_test.save"}}'
-.\tools\send-cmd.ps1 -Json '{"command":"get_situation","params":{}}'
-```
-
-`tools/send-eval.mjs` sends raw Lua from a file, so there is no shell
-quoting pain:
-
-```
-node tools/send-eval.mjs my_snippet.lua
-```
-
-## What the agent can do
-
-- Start, load and save campaigns from the main menu. Custom factions and
-  Mixu lords work: `select_race` / `select_lord` take plain faction keys.
-- Read the scene as text: `get_situation` returns context, turn, faction,
-  gold and an ordered list of everything blocking play (dialogs, dilemmas
-  with full text and choices, battle panels, occupation choices, declare
-  war prompts).
-- Trigger dilemmas and incidents by key, including targeted at the player's
-  legendary lord. Read, answer, dismiss.
-- Move armies, attack, autoresolve or retreat, occupy settlements.
-- Fight real battles on the battle map: `fight_battle` clicks Attack,
-  fights the whole battle at ten times speed, closes the results and
-  returns to the campaign.
-- Cheat for test setups: buildings, regions, research, levels, skills.
-- Soak test: `soak_turns` plays N turns unattended and reports.
-- `check_errors` reads the script error logs from disk. The mod hooks the
-  game's `script_error`, so every scripted error is captured with a turn
-  stamp. Works even after a crash.
-- `cm_search` looks up any of 5,325 indexed campaign (cm) and battle (bm)
-  functions from inside the game, and live-probes whether each one exists
-  on your build.
-- `eval` sends raw Lua straight into the running game.
-
-The full tool list with parameters is in the MCP server's tool
-descriptions (`server/index.js`).
-
-## Building the pack from source
-
-The Lua source is `pack/script/_lib/mod/wh3_mcp.lua`. `build.ps1` packs and
-deploys it, but expects an RPFM MCP server on `127.0.0.1:45127`; packing the
-single file manually with RPFM works just as well (path inside the pack:
-`script/_lib/mod/wh3_mcp.lua`). Kill WH3 before deploying, or the pack file
-is locked. `tools/check-lua.js` (needs `npm i luaparse`) gates the source:
-Lua 5.1 parse plus a ban on plain-flag `string.find`, which corrupts the
-game's string subsystem.
-
-## Notes
-
-- The game keeps running unfocused; the agent works in the background.
-- No network, no telemetry. The mod reads and writes two JSON files in the
-  game folder and nothing else.
-
-## License
-
-MIT
+Transport cannot accept a stale/mismatched response as success; requests are serialized; all protocol writes are atomic; timeout/reset and game-context transitions are recoverable; poll startup is safe and idempotent; process control is non-blocking; missing installs are explicit failures; log reads are safely incremental; `npm test` passes with meaningful tests; docs tell agents exactly how to verify the game-dependent remainder.
