@@ -179,11 +179,8 @@ WH3 accepts and performs the mutation, then exits before publishing a reply
 Node -> error GAME_EXITED or COMMAND_TIMEOUT, outcome:"unknown"
 ```
 
-## A01 hand-off call sites
+## Implementation ownership
 
-A01 defines the contract and validators only. The transport migration in A02 must replace the v1 assumptions at:
+The protocol-v2 contract is implemented by `server/lib/protocol-v2.js` and `server/lib/command-transport.js`; MCP handlers route game commands through that transport rather than publishing protocol files directly. The Lua peer in `pack/script/_lib/mod/wh3_mcp.lua` validates envelopes, owns command consumption/result publication, persists the acceptance/transition ledger, and performs handshake/singleton lifecycle handling.
 
-- `server/index.js`: `sendCommand()`, `clearFiles()`, and every MCP handler that directly calls either;
-- `pack/script/_lib/mod/wh3_mcp.lua`: command-file parse/dispatch in `poll_body()`, every `RESULT_FILE` publication path, context-transition marker handling, and polling bootstrap readiness.
-
-A03 additionally owns the timer capability checks and singleton lifecycle in the Lua initialisation block.
+There is no supported v1 compatibility path. Any new helper or controller that touches the command/result files must preserve the same correlation, atomic-publication, serialisation, quarantine and recovery rules.

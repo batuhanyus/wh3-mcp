@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "pack_name": "wh3_mcp_server.pack",
+  "protocol": 2,
+  "lua_bridge": "script/_lib/mod/wh3_mcp.lua",
+  "lua_sha256": "1c9a7c3ccc523d9c61884463fd6d49b5d867c53fd06400825bbf7d6796ab961c",
+  "readme_sha256": "87f3c38f2abb1c11121c826d8bf77c7c93ee45e502695a24c11a9b2c8013faf2"
+}

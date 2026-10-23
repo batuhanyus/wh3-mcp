@@ -1,29 +1,18 @@
-# send-cmd.ps1 - write a command JSON for the wh3_mcp mod and wait for the result.
+# send-cmd.ps1 - standalone protocol-v2 command helper.
+# DO NOT run while the WH3-MCP Node server or another controller is active.
 # Usage: .\send-cmd.ps1 -Json '{"command":"ping","params":{}}' [-TimeoutSec 30]
-# ASCII only (PS 5.1 reads BOM-less UTF-8 as CP1252).
 param(
     [Parameter(Mandatory = $true)][string]$Json,
     [int]$TimeoutSec = 30
 )
 
-$wh3 = "C:\Program Files (x86)\Steam\steamapps\common\Total War WARHAMMER III"
-$cmdFile = Join-Path $wh3 "wh3_mcp_command.json"
-$resFile = Join-Path $wh3 "wh3_mcp_result.json"
-
-Remove-Item $resFile -ErrorAction SilentlyContinue
-Set-Content -Path $cmdFile -Value $Json -NoNewline -Encoding Ascii
-
-$deadline = (Get-Date).AddSeconds($TimeoutSec)
-while ((Get-Date) -lt $deadline) {
-    if (Test-Path $resFile) {
-        Start-Sleep -Milliseconds 300
-        $r = Get-Content $resFile -Raw -ErrorAction SilentlyContinue
-        if ($r) {
-            Remove-Item $resFile -ErrorAction SilentlyContinue
-            Write-Output $r
-            return
-        }
-    }
-    Start-Sleep -Milliseconds 500
+$ErrorActionPreference = 'Stop'
+$Helper = Join-Path $PSScriptRoot 'send-command-v2.mjs'
+$Temp = Join-Path $env:TEMP ("wh3_mcp_helper_" + [guid]::NewGuid().ToString('N') + '.json')
+try {
+    [System.IO.File]::WriteAllText($Temp, $Json, [System.Text.UTF8Encoding]::new($false))
+    & node $Helper --json-file $Temp $TimeoutSec
+    exit $LASTEXITCODE
+} finally {
+    Remove-Item $Temp -Force -ErrorAction SilentlyContinue
 }
-Write-Output ('{"status":"timeout","error":"no result within ' + $TimeoutSec + 's"}')

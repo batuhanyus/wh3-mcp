@@ -9,7 +9,9 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "verify:package": "node ../tools/verify-package.mjs",
+    "verify:offline": "node ../tools/verify-offline.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

@@ -12,28 +12,40 @@ https://github.com/PassingByPixels/wh3-mcp
 
 1. THE PROTOCOL
 ---------------
-The mod polls for a command file once per second, in every context the game
-has (main menu, campaign, battle):
+The mod and the bundled Node server use file transport protocol v2. Use the
+server unless you are deliberately implementing the protocol yourself. There
+is no v1 fallback. Exactly one controller/server session should own the two
+protocol files at a time.
+
+The files live beside Warhammer3.exe:
 
   WRITE:  <WH3 install dir>\wh3_mcp_command.json
-          {"command": "<name>", "params": { ... }}
   READ:   <WH3 install dir>\wh3_mcp_result.json
-          {"status": "ok", "result": { ... }}   or
-          {"status": "error", "error": "<message>"}
 
-The install dir is the folder containing Warhammer3.exe, usually
-C:\Program Files (x86)\Steam\steamapps\common\Total War WARHAMMER III
+Every request is an identity-bearing envelope, for example:
+
+  {"protocol":2,"session_id":"server-...","request_id":42,
+   "command":"ping","params":{}}
+
+Every reply repeats protocol/session/request identity:
+
+  {"protocol":2,"session_id":"server-...","request_id":42,
+   "status":"ok","result":{"pong":true}}
 
 Rules:
-- One command at a time. The mod deletes the command file when it has
-  processed it, then writes the result file. Delete the result file before
-  sending, then poll for it (300-500 ms interval is fine).
-- If the command file is still there after your timeout, the mod is not
-  polling (game loading, context transition, or not running).
-- Some commands defer their result by several seconds (they run across poll
-  ticks): load_campaign, start_campaign, autoresolve_battle, open_diplomacy,
-  start_research, answer_move_options, dismiss_battle_results, quit_to_menu,
-  exit_to_windows. Use generous timeouts (60-180 s) for those.
+- The Node transport serialises requests and publishes files atomically. Do
+  not write these files from a second helper while the MCP server is active.
+- A fresh server session starts with a __handshake request. A fresh Lua
+  context is NOT_READY until that handshake succeeds.
+- Replies with the wrong protocol, session_id, request_id, or transition_id
+  are rejected/quarantined. They never satisfy a newer command.
+- A timeout or game crash after a state-changing command was accepted has an
+  unknown outcome. Do not automatically replay the mutation. Re-establish
+  readiness, inspect state, then decide explicitly.
+- Context-changing commands may take 60-180 s and cause the Lua script to
+  reload. The server performs a fresh handshake before normal work resumes.
+
+The full contract is docs/PROTOCOL_V2.md in the source repository.
 
 
 2. BOOTING THE GAME
@@ -44,9 +56,10 @@ Rules:
    launcher cannot rewrite it.
 2. Start the exe directly, never through the launcher:
      Warhammer3.exe --feature disable_intro_videos
-3. Send {"command":"ping"} on a long timeout (up to 240 s). When it answers
-   {"pong":true}, the mod is live. ping also reports in_campaign and
-   strings_ok (see section 10).
+3. Start the Node MCP server, then call wh3_wait_for_mod (or wh3_ping) on
+   a long timeout. The server performs the protocol-v2 handshake and rejects
+   stale/mismatched replies. A successful ping reports pong, context and
+   strings_ok.
 4. Rarely the legal splash screen hangs and ignores keys. A REAL mouse click
    on the game window advances it (synthetic UI clicks do not exist yet at
    that point).
@@ -248,18 +261,28 @@ guards this for you.
 
 10. BUILDING YOUR OWN MCP SERVER
 --------------------------------
-Everything reduces to one function:
+Do not implement the old uncorrelated {command,params}/{status,...} exchange.
+A protocol-v2 controller must:
 
-  send(command, params, timeout):
-    delete <WH3>\wh3_mcp_result.json if present
-    write  <WH3>\wh3_mcp_command.json  = {"command":..., "params":...}
-    poll every 300-500 ms until the result file exists, read it, delete it,
-    parse JSON, return it
+  1. create a fresh opaque session_id on process start;
+  2. allocate monotonically increasing request_id values;
+  3. publish complete JSON atomically (temp file + rename);
+  4. serialise to one in-flight request;
+  5. perform __handshake after server start and after Lua-context reloads;
+  6. accept a reply only when protocol/session/request/transition identity
+     matches the active request;
+  7. quarantine malformed, stale, mismatched, and late replies; and
+  8. never auto-replay an ambiguous state-changing request after timeout or
+     process/context loss.
 
-Expose each command from section 5 as a tool that calls send(). Add:
-  - a launch tool that starts Warhammer3.exe --feature disable_intro_videos
-  - a wait tool that pings until the mod answers
-  - a log tool that reads wh3_mcp_script_errors.log from disk
-Or skip all of that and clone the finished server (Node 18+, one npm
-dependency, auto-detects the install path, ~80 tools):
+The reference implementation is the bundled Node server. Node 18+ is
+required. Run the repository offline release gate before live use:
+
+  cd server
+  npm run verify:offline
+
+For a custom WH3 install set WH3_INSTALL_DIR to the directory containing
+Warhammer3.exe. WH3_INSTALL_PATH remains a legacy compatibility alias.
+
+Ready-made server and full protocol documentation:
 https://github.com/PassingByPixels/wh3-mcp
