@@ -59,6 +59,17 @@ export function validateRequestEnvelope(value) {
   if (!isPlainObject(value.params)) {
     throw new ProtocolValidationError('INVALID_REQUEST', 'request.params must be a JSON object');
   }
+  if (value.transition_id !== undefined &&
+      (typeof value.transition_id !== 'string' || value.transition_id.trim() === '' || value.transition_id.length > 256)) {
+    throw new ProtocolValidationError('INVALID_REQUEST', 'request.transition_id must be a non-empty string <= 256 characters');
+  }
+  if (value.transition_destination !== undefined &&
+      (typeof value.transition_destination !== 'string' || value.transition_destination.trim() === '' || value.transition_destination.length > 128)) {
+    throw new ProtocolValidationError('INVALID_REQUEST', 'request.transition_destination must be a non-empty string <= 128 characters');
+  }
+  if (value.transition_destination !== undefined && value.transition_id === undefined) {
+    throw new ProtocolValidationError('INVALID_REQUEST', 'request.transition_destination requires request.transition_id');
+  }
   return value;
 }
 
@@ -67,6 +78,10 @@ export function validateReplyEnvelope(value) {
     throw new ProtocolValidationError('INVALID_RESPONSE', 'reply must be a JSON object');
   }
   validateIdentity(value, 'response');
+  if (value.transition_id !== undefined &&
+      (typeof value.transition_id !== 'string' || value.transition_id.trim() === '' || value.transition_id.length > 256)) {
+    throw new ProtocolValidationError('INVALID_RESPONSE', 'reply.transition_id must be a non-empty string <= 256 characters');
+  }
   if (value.status !== 'ok' && value.status !== 'error') {
     throw new ProtocolValidationError('INVALID_RESPONSE', 'reply.status must be "ok" or "error"');
   }
@@ -114,17 +129,60 @@ export function assertReplyMatchesRequest(reply, request) {
       received: { session_id: reply.session_id, request_id: reply.request_id },
     });
   }
+  if (request.transition_id !== undefined && reply.transition_id !== request.transition_id) {
+    throw new ProtocolValidationError('STALE_RESPONSE', 'reply transition identity does not match the active request', {
+      expected: { transition_id: request.transition_id },
+      received: { transition_id: reply.transition_id ?? null },
+    });
+  }
+  if (request.transition_id !== undefined && reply.status === 'ok') {
+    const transition = reply.result?.transition;
+    if (!isPlainObject(transition)) {
+      throw new ProtocolValidationError('INVALID_RESPONSE', 'transition reply must contain result.transition metadata');
+    }
+    if (transition.transition_id !== request.transition_id) {
+      throw new ProtocolValidationError('STALE_RESPONSE', 'completion transition identity does not match the active request', {
+        expected: { transition_id: request.transition_id },
+        received: { transition_id: transition.transition_id ?? null },
+      });
+    }
+    if (request.transition_destination !== undefined && transition.destination !== request.transition_destination) {
+      throw new ProtocolValidationError('STALE_RESPONSE', 'completion destination does not match the active transition', {
+        expected: { destination: request.transition_destination },
+        received: { destination: transition.destination ?? null },
+      });
+    }
+    if (typeof transition.context !== 'string' || transition.context.trim() === '' ||
+        typeof transition.outcome !== 'string' || transition.outcome.trim() === '') {
+      throw new ProtocolValidationError('INVALID_RESPONSE', 'transition completion must include non-empty context and outcome');
+    }
+  }
   return reply;
 }
 
-export function makeRequest({ sessionId, requestId, command, params = {} }) {
-  return validateRequestEnvelope({
+export function makeRequest({
+  sessionId,
+  requestId,
+  command,
+  params = {},
+  transitionId = undefined,
+  transitionDestination = undefined,
+}) {
+  const request = {
     protocol: PROTOCOL_VERSION,
     session_id: sessionId,
     request_id: requestId,
     command,
     params,
-  });
+  };
+  if (transitionId !== undefined) {
+    if (typeof transitionId !== 'string' || transitionId.trim() === '' || transitionId.length > 256) {
+      throw new ProtocolValidationError('INVALID_REQUEST', 'request.transition_id must be a non-empty string <= 256 characters');
+    }
+    request.transition_id = transitionId;
+  }
+  if (transitionDestination !== undefined) request.transition_destination = transitionDestination;
+  return validateRequestEnvelope(request);
 }
 
 export function makeErrorReply({ sessionId, requestId, code, message, details }) {

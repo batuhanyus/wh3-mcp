@@ -8,13 +8,28 @@ import { CommandTransport } from '../lib/command-transport.js';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function okReply(req, result = {}) {
-  return {
+  let responseResult = result;
+  if (req.transition_id) {
+    responseResult = { ...result };
+    if (!responseResult.transition) {
+      const destination = req.transition_destination;
+      responseResult.transition = {
+        transition_id: req.transition_id,
+        destination,
+        context: destination === 'main_menu' ? 'frontend' : (destination === 'game_exited' ? 'campaign' : destination),
+        outcome: 'completed',
+      };
+    }
+  }
+  const reply = {
     protocol: 2,
     session_id: req.session_id,
     request_id: req.request_id,
     status: 'ok',
-    result,
+    result: responseResult,
   };
+  if (req.transition_id) reply.transition_id = req.transition_id;
+  return reply;
 }
 
 async function atomicResult(root, value) {
@@ -257,5 +272,197 @@ test('a restarted server uses a new session and cannot consume the previous sess
   const handshakes = game.seen.filter((r) => r.command === '__handshake');
   assert.equal(handshakes.length, 2);
   assert.notEqual(handshakes[0].session_id, handshakes[1].session_id);
+  await game.stop();
+}));
+
+
+test('transition requests carry identity, enter reconnect state, and handshake before the next ordinary command', async () => withTemp(async (root) => {
+  let context = 'frontend';
+  let instance = 'front-1';
+  const game = startFakeGame(root, async (req) => {
+    if (req.command === '__handshake') return okReply(req, { ready: true, instance, context });
+    if (req.command === 'load_campaign') {
+      await sleep(20);
+      context = 'campaign';
+      instance = 'campaign-1';
+      return okReply(req, {
+        loaded: true,
+        transition: { transition_id: req.transition_id, destination: 'campaign', context, outcome: 'completed' },
+      });
+    }
+    return okReply(req, { command: req.command, context });
+  });
+  const transport = new CommandTransport({ rootDir: root, pollIntervalMs: 2 });
+  const loaded = await transport.send('load_campaign', { filename: 'x.save' }, 300);
+  assert.equal(loaded.status, 'ok');
+  const transitionReq = game.seen.find((r) => r.command === 'load_campaign');
+  assert.match(transitionReq.transition_id, /^transition-/);
+  assert.equal(transport.getStatus().state, 'RECONNECTING');
+
+  const read = await transport.send('get_status', {}, 300);
+  assert.equal(read.status, 'ok');
+  const order = game.seen.map((r) => r.command);
+  assert.deepEqual(order, ['__handshake', 'load_campaign', '__handshake', 'get_status']);
+  assert.equal(transport.getStatus().state, 'READY');
+  assert.equal(transport.getStatus().context, 'campaign');
+  await game.stop();
+}));
+
+test('duplicate completed transition reply is quarantined before reconnect and cannot satisfy new work', async () => withTemp(async (root) => {
+  let context = 'frontend';
+  const game = startFakeGame(root, async (req) => {
+    if (req.command === '__handshake') return okReply(req, { ready: true, instance: `fake-${context}`, context });
+    if (req.command === 'load_campaign') {
+      context = 'campaign';
+      return okReply(req, { loaded: true });
+    }
+    return okReply(req, { command: req.command, context });
+  });
+  const transport = new CommandTransport({ rootDir: root, pollIntervalMs: 2 });
+  const loaded = await transport.send('load_campaign', {}, 300);
+  assert.equal(loaded.status, 'ok');
+  const oldRequest = game.seen.find((r) => r.command === 'load_campaign');
+
+  await atomicResult(root, okReply(oldRequest, { duplicate: true }));
+  const next = await transport.send('get_status', {}, 300);
+  assert.equal(next.status, 'ok');
+  assert.equal(next.result.command, 'get_status');
+  assert.equal(next.result.duplicate, undefined);
+  assert.deepEqual(game.seen.map((r) => r.command), ['__handshake', 'load_campaign', '__handshake', 'get_status']);
+  await game.stop();
+}));
+
+test('uncorrelated transition reply cannot complete a fresh transition', async () => withTemp(async (root) => {
+  const game = startFakeGame(root, async (req, ctx) => {
+    if (req.command === '__handshake') return okReply(req, { ready: true, instance: 'fake', context: 'frontend' });
+    if (req.command === 'load_campaign') {
+      await ctx.publish({
+        protocol: 2,
+        session_id: req.session_id,
+        request_id: req.request_id,
+        transition_id: 'transition-stale',
+        status: 'ok',
+        result: { stale: true },
+      });
+      await sleep(15);
+      return okReply(req, { fresh: true });
+    }
+    return okReply(req, {});
+  });
+  const transport = new CommandTransport({ rootDir: root, pollIntervalMs: 2 });
+  const reply = await transport.send('load_campaign', {}, 300);
+  assert.equal(reply.status, 'ok');
+  assert.equal(reply.result.fresh, true);
+  await game.stop();
+}));
+
+test('timed-out state-changing transition is not automatically replayed during recovery', async () => withTemp(async (root) => {
+  let context = 'frontend';
+  let loadCount = 0;
+  const game = startFakeGame(root, async (req) => {
+    if (req.command === '__handshake') return okReply(req, { ready: true, instance: `fake-${context}`, context });
+    if (req.command === 'load_campaign') {
+      loadCount += 1;
+      context = 'campaign';
+      return null;
+    }
+    return okReply(req, { context });
+  });
+  const transport = new CommandTransport({ rootDir: root, pollIntervalMs: 2 });
+  const timed = await transport.send('load_campaign', {}, 35);
+  assert.equal(timed.error.code, 'COMMAND_TIMEOUT');
+  assert.equal(transport.getStatus().state, 'FAILED');
+  const read = await transport.send('get_status', {}, 300);
+  assert.equal(read.status, 'ok');
+  assert.equal(loadCount, 1, 'ambiguous transition must not be replayed');
+  assert.deepEqual(game.seen.map((r) => r.command), ['__handshake', 'load_campaign', '__handshake', 'get_status']);
+  await game.stop();
+}));
+
+test('game exit interrupts active transition and queued work never reaches the fake game', async () => withTemp(async (root) => {
+  let running = true;
+  const game = startFakeGame(root, async (req) => {
+    if (req.command === '__handshake') return okReply(req, { ready: true, instance: 'fake', context: 'frontend' });
+    if (req.command === 'load_campaign') {
+      setTimeout(() => { running = false; }, 10);
+      return null;
+    }
+    return okReply(req, {});
+  });
+  const transport = new CommandTransport({ rootDir: root, pollIntervalMs: 2, isGameRunning: () => running });
+  const active = transport.send('load_campaign', {}, 500);
+  await sleep(5);
+  const queued = transport.send('must_not_execute', {}, 500);
+  const first = await active;
+  const second = await queued;
+  assert.equal(first.error.code, 'GAME_EXITED');
+  assert.equal(second.error.code, 'GAME_EXITED');
+  assert.equal(game.seen.some((r) => r.command === 'must_not_execute'), false);
+  await game.stop();
+}));
+
+test('two concurrent transition attempts are serialized and retain distinct transition identities', async () => withTemp(async (root) => {
+  let context = 'frontend';
+  const game = startFakeGame(root, async (req) => {
+    if (req.command === '__handshake') return okReply(req, { ready: true, instance: context, context });
+    if (req.command === 'load_campaign') {
+      await sleep(20);
+      context = 'campaign';
+      return okReply(req, { loaded: true });
+    }
+    if (req.command === 'quit_to_menu') {
+      await sleep(20);
+      context = 'frontend';
+      return okReply(req, { quit: true });
+    }
+    return okReply(req, {});
+  });
+  const transport = new CommandTransport({ rootDir: root, pollIntervalMs: 2 });
+  const [a, b] = await Promise.all([
+    transport.send('load_campaign', {}, 500),
+    transport.send('quit_to_menu', {}, 500),
+  ]);
+  assert.equal(a.status, 'ok');
+  assert.equal(b.status, 'ok');
+  const transitions = game.seen.filter((r) => r.transition_id);
+  assert.equal(transitions.length, 2);
+  assert.notEqual(transitions[0].transition_id, transitions[1].transition_id);
+  assert.equal(game.maxActive, 1);
+  await game.stop();
+}));
+
+test('protocol and quarantine paths are rejected when they escape the approved root', async () => withTemp(async (root) => {
+  assert.throws(() => new CommandTransport({
+    rootDir: root,
+    commandFile: join(root, '..', 'outside-command.json'),
+  }), /beneath rootDir/);
+  assert.throws(() => new CommandTransport({
+    rootDir: root,
+    quarantineDir: join(root, '..', 'outside-quarantine'),
+  }), /beneath rootDir/);
+}));
+
+test('unexpected reconnect context blocks the next command once and never replays the timed-out mutation', async () => withTemp(async (root) => {
+  let loadCount = 0;
+  const game = startFakeGame(root, async (req) => {
+    if (req.command === '__handshake') return okReply(req, { ready: true, instance: 'fake', context: 'frontend' });
+    if (req.command === 'load_campaign') {
+      loadCount += 1;
+      return null;
+    }
+    return okReply(req, { command: req.command });
+  });
+  const transport = new CommandTransport({ rootDir: root, pollIntervalMs: 2 });
+  const timed = await transport.send('load_campaign', {}, 30);
+  assert.equal(timed.error.code, 'COMMAND_TIMEOUT');
+
+  const blocked = await transport.send('get_status', {}, 200);
+  assert.equal(blocked.error.code, 'CONTEXT_CHANGED');
+  assert.equal(loadCount, 1);
+  assert.equal(game.seen.some((r) => r.command === 'get_status'), false);
+
+  const explicitRetry = await transport.send('get_status', {}, 200);
+  assert.equal(explicitRetry.status, 'ok');
+  assert.equal(loadCount, 1);
   await game.stop();
 }));

@@ -22,7 +22,7 @@ local DOCS_FILE = "wh3_mcp_docs.tsv"
 local POLL_INTERVAL = 1000  -- milliseconds between polls
 local DEBUG_LOG = "wh3_mcp_debug.log"
 -- Absolute path verified from wh3_status; deliberately independent of cwd.
-local POLL_DIAGNOSTIC_LOG = "D:\\Program Files (x86)\\Steam\\steamapps\\common\\Total War WARHAMMER III\\wh3_mcp_poll_diagnostic.log"
+local POLL_DIAGNOSTIC_LOG = "wh3_mcp_poll_diagnostic.log"
 local POLL_CALLBACK_NAME = "wh3_mcp_poll"
 local CAMPAIGN_START_MARKER = "wh3_mcp_starting_campaign.marker"
 local QUIT_MARKER = "wh3_mcp_quitting.marker"
@@ -106,11 +106,6 @@ local debug_log
 
 -- Helper: write successful campaign start result
 local function write_campaign_success()
-    campaign_start_pending = false
-    ui_nav_state = 0
-    continue_wait_start = 0
-    core:remove_listener("Wh3McpCampaignStarted")
-    delete_file(CAMPAIGN_START_MARKER)
     local result = json.encode({
         status = "ok",
         result = {
@@ -120,8 +115,19 @@ local function write_campaign_success()
             already_in_campaign = true,
         }
     })
-    write_file(RESULT_FILE, result)
-    debug_log("Campaign load complete, result written")
+    local wrote, write_err = write_file(RESULT_FILE, result)
+    if wrote then
+        campaign_start_pending = false
+        ui_nav_state = 0
+        continue_wait_start = 0
+        core:remove_listener("Wh3McpCampaignStarted")
+        delete_file(CAMPAIGN_START_MARKER)
+        debug_log("Campaign load complete, result written")
+    else
+        campaign_start_pending = true
+        debug_log("Campaign load result publish failed: " .. tostring(write_err))
+    end
+    return wrote, write_err
 end
 
 -- ---------------------------------------------------------------------------
@@ -367,6 +373,7 @@ if is_primary_instance then
         session_id = nil,
         session_started_at_ms = 0,
         last_request_id = 0,
+        last_completed_transition_id = nil,
         active_request = nil,
         reply_cache = {},
         reply_order = {},
@@ -393,9 +400,31 @@ local function protocol_reply(req, status, payload)
         request_id = req.request_id,
         status = status,
     }
+    if type(req.transition_id) == "string" and req.transition_id ~= "" then
+        reply.transition_id = req.transition_id
+    end
     if status == "ok" then
+        if type(payload) == "table" and reply.transition_id and payload.transition == nil then
+            payload.transition = {
+                transition_id = reply.transition_id,
+                destination = req.transition_destination,
+                context = poll_context_name(),
+                outcome = "completed",
+            }
+        end
         reply.result = payload
     else
+        if type(payload) == "table" and reply.transition_id then
+            payload.details = type(payload.details) == "table" and payload.details or {}
+            if payload.details.transition == nil then
+                payload.details.transition = {
+                    transition_id = reply.transition_id,
+                    destination = req.transition_destination,
+                    context = poll_context_name(),
+                    outcome = "failed",
+                }
+            end
+        end
         reply.error = payload
     end
     return reply
@@ -455,6 +484,7 @@ local function persist_session_ledger()
         session_id = runtime.session_id,
         session_started_at_ms = tonumber(runtime.session_started_at_ms) or 0,
         last_request_id = tonumber(runtime.last_request_id) or 0,
+        last_completed_transition_id = runtime.last_completed_transition_id,
     })
     return atomic_write_raw(SESSION_STATE_FILE, encoded, "ledger")
 end
@@ -469,6 +499,8 @@ local function load_session_ledger()
         runtime.session_id = state.session_id
         runtime.session_started_at_ms = tonumber(state.session_started_at_ms) or 0
         runtime.last_request_id = math.max(0, math.floor(state.last_request_id))
+        runtime.last_completed_transition_id = type(state.last_completed_transition_id) == "string" and
+                                               state.last_completed_transition_id or nil
         runtime.context_reloaded = true
     end
 end
@@ -494,6 +526,16 @@ local function validate_request_envelope(command)
     if type(command.params) ~= "table" then
         return false, "INVALID_REQUEST", "request.params must be an object"
     end
+    if command.transition_id ~= nil and (type(command.transition_id) ~= "string" or command.transition_id == "") then
+        return false, "INVALID_REQUEST", "request.transition_id must be a non-empty string when present"
+    end
+    if command.transition_destination ~= nil and
+       (type(command.transition_destination) ~= "string" or command.transition_destination == "") then
+        return false, "INVALID_REQUEST", "request.transition_destination must be a non-empty string when present"
+    end
+    if command.transition_destination ~= nil and command.transition_id == nil then
+        return false, "INVALID_REQUEST", "request.transition_destination requires request.transition_id"
+    end
     return true
 end
 
@@ -515,11 +557,32 @@ local function normalize_legacy_result(req, legacy)
     return protocol_reply(req, "error", protocol_error(code, tostring(text or "command failed")))
 end
 
+local function mark_transition_completed(transition_id)
+    if type(transition_id) ~= "string" or transition_id == "" then return true end
+    local previous = runtime.last_completed_transition_id
+    runtime.last_completed_transition_id = transition_id
+    local ok, err = persist_session_ledger()
+    if not ok then
+        runtime.last_completed_transition_id = previous
+        return false, err
+    end
+    return true
+end
+
 local function publish_protocol_reply(reply)
     local ok_encode, encoded = pcall(json.encode, reply)
     if not ok_encode then return false, "encode_failed:" .. tostring(encoded) end
     local ok_write, err = atomic_write_raw(RESULT_FILE, encoded, tostring(reply.session_id) .. "-" .. tostring(reply.request_id))
-    if ok_write then cache_reply(reply, encoded) end
+    if ok_write then
+        cache_reply(reply, encoded)
+        if type(reply.transition_id) == "string" and reply.transition_id ~= "" then
+            local marked, mark_err = mark_transition_completed(reply.transition_id)
+            if not marked then
+                debug_log("transition_completion_ledger_failed transition=" .. tostring(reply.transition_id) ..
+                          " error=" .. tostring(mark_err))
+            end
+        end
+    end
     return ok_write, err
 end
 
@@ -572,9 +635,22 @@ local function accept_request(req)
 end
 
 local function restore_active_request(data)
-    if type(data) ~= "table" then return false end
+    if type(data) ~= "table" then return false, "not_table" end
     if data.protocol ~= PROTOCOL_VERSION or type(data.session_id) ~= "string" or type(data.request_id) ~= "number" then
-        return false
+        return false, "invalid_identity"
+    end
+    if runtime.session_id ~= nil and runtime.session_id ~= data.session_id then
+        return false, "session_mismatch"
+    end
+    if type(data.transition_id) ~= "string" or data.transition_id == "" then
+        return false, "missing_transition_id"
+    end
+    if runtime.last_completed_transition_id == data.transition_id then
+        return false, "transition_already_completed"
+    end
+    local accepted = tonumber(runtime.last_request_id) or 0
+    if accepted > 0 and data.request_id ~= accepted then
+        return false, "request_mismatch"
     end
     runtime.active_request = {
         protocol = PROTOCOL_VERSION,
@@ -582,6 +658,8 @@ local function restore_active_request(data)
         request_id = data.request_id,
         command = tostring(data.command or "context_transition"),
         params = type(data.params) == "table" and data.params or {},
+        transition_id = data.transition_id,
+        transition_destination = data.destination,
     }
     return true
 end
@@ -4563,6 +4641,8 @@ local function handle_quit_tick()
                 protocol = PROTOCOL_VERSION,
                 session_id = active.session_id,
                 request_id = active.request_id,
+                transition_id = active.transition_id,
+                destination = active.transition_destination or "main_menu",
                 command = "quit_to_menu",
                 params = active.params or {},
                 dialog = text,
@@ -4585,11 +4665,11 @@ local function handle_quit_tick()
         if not in_campaign() then
             quit_pending = false
             quit_stage = nil
-            delete_file(QUIT_MARKER)
-            write_file(RESULT_FILE, json.encode({
+            local wrote = write_file(RESULT_FILE, json.encode({
                 status = "ok",
                 result = { quit = true, in_campaign = false },
             }))
+            if wrote then delete_file(QUIT_MARKER) end
             debug_log("quit: left the campaign in-process, result written")
         end
         return
@@ -5440,6 +5520,7 @@ local function poll_body()
             runtime.session_id = command.session_id
             runtime.session_started_at_ms = incoming_started
             runtime.last_request_id = 0
+            runtime.last_completed_transition_id = nil
             runtime.reply_cache = {}
             runtime.reply_order = {}
             runtime.ready = false
@@ -5537,6 +5618,8 @@ local function poll_body()
                 protocol = PROTOCOL_VERSION,
                 session_id = command.session_id,
                 request_id = command.request_id,
+                transition_id = command.transition_id,
+                destination = command.transition_destination or "campaign",
                 command = command.command,
                 params = command.params,
                 is_new_game = campaign_start_params.is_new_game,
@@ -5765,14 +5848,15 @@ local function check_quit_transition()
     if not marker then return false end
     local marker_content = marker:read("*a")
     marker:close()
-    delete_file(QUIT_MARKER)
 
     local ok_marker, marker_data = pcall(json.decode, marker_content)
-    if not ok_marker or not restore_active_request(marker_data) then
-        debug_log("quit_transition_marker_invalid")
+    local restored, restore_reason = false, "decode_failed"
+    if ok_marker then restored, restore_reason = restore_active_request(marker_data) end
+    if not ok_marker or not restored then
+        quarantine_protocol_file(QUIT_MARKER, "uncorrelated-transition-" .. tostring(restore_reason))
+        debug_log("quit_transition_marker_invalid reason=" .. tostring(restore_reason))
         return true
     end
-
     local result_file = io.open(RESULT_FILE, "r")
     if result_file then
         result_file:close()
@@ -5780,17 +5864,29 @@ local function check_quit_transition()
         return true
     end
 
+    local wrote
     if in_campaign() then
-        write_file(RESULT_FILE, json.encode({
+        wrote = write_file(RESULT_FILE, json.encode({
             status = "error",
             error = "quit_to_menu: script reloaded but still in a campaign",
         }))
     else
-        write_file(RESULT_FILE, json.encode({
+        wrote = write_file(RESULT_FILE, json.encode({
             status = "ok",
-            result = { quit = true, in_campaign = false, method = "reload_detected" },
+            result = {
+                quit = true,
+                in_campaign = false,
+                method = "reload_detected",
+                transition = {
+                    transition_id = marker_data.transition_id,
+                    destination = marker_data.destination or "main_menu",
+                    context = poll_context_name(),
+                    outcome = "completed",
+                },
+            },
         }))
     end
+    if wrote then delete_file(QUIT_MARKER) end
     return true
 end
 
@@ -5804,18 +5900,21 @@ local function check_context_transition()
     end
     local marker_content = marker:read("*a")
     marker:close()
-    delete_file(CAMPAIGN_START_MARKER)
 
-    -- Parse marker to get is_new_game flag
+    -- Parse marker to get is_new_game flag and verify it still belongs to the
+    -- accepted server/session request before it is allowed to complete anything.
     local is_new_game = false
     local ok, marker_data = pcall(json.decode, marker_content)
     if ok and type(marker_data) == "table" then
         is_new_game = marker_data.is_new_game or false
-        if not restore_active_request(marker_data) then
-            debug_log("campaign_transition_marker_missing_protocol_identity")
+        local restored, restore_reason = restore_active_request(marker_data)
+        if not restored then
+            quarantine_protocol_file(CAMPAIGN_START_MARKER, "uncorrelated-transition-" .. tostring(restore_reason))
+            debug_log("campaign_transition_marker_uncorrelated reason=" .. tostring(restore_reason))
             return
         end
     else
+        quarantine_protocol_file(CAMPAIGN_START_MARKER, "invalid-transition-marker")
         debug_log("campaign_transition_marker_invalid")
         return
     end
@@ -5845,7 +5944,8 @@ local function check_context_transition()
                     already_in_campaign = true,
                 }
             })
-            write_file(RESULT_FILE, result)
+            local wrote = write_file(RESULT_FILE, result)
+            if wrote then delete_file(CAMPAIGN_START_MARKER) end
         end
     else
         -- Case B: Campaign start was attempted but failed
@@ -5854,7 +5954,8 @@ local function check_context_transition()
             status = "error",
             error = "campaign start failed during initialization"
         })
-        write_file(RESULT_FILE, result)
+        local wrote = write_file(RESULT_FILE, result)
+        if wrote then delete_file(CAMPAIGN_START_MARKER) end
     end
 end
 if is_primary_instance then check_context_transition() end

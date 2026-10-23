@@ -8,7 +8,7 @@
  *
  * Tools exposed to the agent:
  *   wh3_start          - Launch Warhammer 3
- *   wh3_stop           - Kill Warhammer 3
+ *   wh3_stop           - Stop a WH3 process owned by this MCP
  *   wh3_status         - Check if WH3 is running
  *   wh3_send_command   - Send a command to the WH3 mod and wait for result
  *   wh3_ping           - Test if the mod is responding
@@ -23,11 +23,13 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { spawn, execSync } from 'child_process';
-import { readFileSync, existsSync, copyFileSync, statSync, readdirSync } from 'fs';
-import { join, dirname, basename } from 'path';
+import { execFileSync } from 'node:child_process';
+import { existsSync, copyFileSync, statSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'url';
 import { CommandTransport } from './lib/command-transport.js';
+import { DiagnosticsReader } from './lib/diagnostics.js';
+import { resolveBeneathRoot, resolveWh3Install, Wh3ProcessManager } from './lib/wh3-runtime.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -35,58 +37,24 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Configuration
 // ---------------------------------------------------------------------------
 
-// Detect WH3 install path from an explicit override, Steam locations, or registry.
-function hasWh3Executable(installPath) {
-  try {
-    return statSync(join(installPath, 'Warhammer3.exe')).isFile();
-  } catch {
-    return false;
-  }
-}
+// Resolve once at server startup. An invalid explicit override is a hard error;
+// it is never replaced by a guessed fallback path.
+const WH3_INSTALL = await resolveWh3Install();
+const WH3_PATH = WH3_INSTALL.ok ? WH3_INSTALL.path : null;
+const WH3_EXE = WH3_INSTALL.ok ? WH3_INSTALL.exe : null;
 
-function findWh3Path() {
-  const configuredPath = process.env.WH3_INSTALL_PATH?.trim();
-  if (configuredPath) return configuredPath;
+// Files live in the validated WH3 root. Lua opens these names relative to the
+// game process working directory, so there is no reason to allow arbitrary
+// paths here.
+const COMMAND_FILE = WH3_PATH ? resolveBeneathRoot(WH3_PATH, 'wh3_mcp_command.json') : null;
+const RESULT_FILE = WH3_PATH ? resolveBeneathRoot(WH3_PATH, 'wh3_mcp_result.json') : null;
 
-  const candidates = [
-    'D:\\Program Files (x86)\\Steam\\steamapps\\common\\Total War WARHAMMER III',
-    'C:\\Program Files (x86)\\Steam\\steamapps\\common\\Total War WARHAMMER III',
-    'D:\\SteamLibrary\\steamapps\\common\\Total War WARHAMMER III',
-    'E:\\SteamLibrary\\steamapps\\common\\Total War WARHAMMER III',
-  ];
-  for (const p of candidates) {
-    if (hasWh3Executable(p)) return p;
-  }
-  // Try to find via Steam registry; reject stale or empty registry values.
-  try {
-    const output = execSync(
-      'reg query "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 1142710" /v InstallLocation 2>nul',
-      { encoding: 'utf8' }
-    );
-    const match = output.match(/InstallLocation\s+REG_SZ\s+(.+)/);
-    if (match) {
-      const registryPath = match[1].trim();
-      if (registryPath && hasWh3Executable(registryPath)) return registryPath;
-    }
-  } catch {}
-  return candidates[0]; // keep an actionable path for executable-not-found errors
-}
-
-const WH3_PATH = findWh3Path();
-const WH3_EXE = join(WH3_PATH, 'Warhammer3.exe');
-// Files go in WH3 root (working directory of the game process).
-// The Lua mod uses io.open() with relative paths, which resolves against the
-// game's working directory — NOT the data/ subdirectory.
-const COMMAND_FILE = join(WH3_PATH, 'wh3_mcp_command.json');
-const RESULT_FILE = join(WH3_PATH, 'wh3_mcp_result.json');
-
-// cm_search docs corpus: committed in server/data, deployed to the WH3 root
-// where the mod stream-reads it. Updating it never needs a pack rebuild -
-// regenerate with tools/build-docs-corpus.js and restart this server.
+// cm_search docs corpus: committed in server/data, deployed to the WH3 root.
 const DOCS_SRC = join(__dirname, 'data', 'wh3_mcp_docs.tsv');
-const DOCS_DEST = join(WH3_PATH, 'wh3_mcp_docs.tsv');
+const DOCS_DEST = WH3_PATH ? resolveBeneathRoot(WH3_PATH, 'wh3_mcp_docs.tsv') : null;
 
 function deployDocsCorpus() {
+  if (!DOCS_DEST) return;
   try {
     if (!existsSync(DOCS_SRC)) {
       console.error('[wh3-mcp] docs corpus missing (server/data/wh3_mcp_docs.tsv) - wh3_cm_search will run introspection-only');
@@ -95,7 +63,7 @@ function deployDocsCorpus() {
     const src = statSync(DOCS_SRC);
     if (existsSync(DOCS_DEST)) {
       const dest = statSync(DOCS_DEST);
-      if (dest.size === src.size && dest.mtimeMs >= src.mtimeMs) return; // up to date
+      if (dest.size === src.size && dest.mtimeMs >= src.mtimeMs) return;
     }
     copyFileSync(DOCS_SRC, DOCS_DEST);
     console.error(`[wh3-mcp] deployed docs corpus (${src.size} bytes) to ${DOCS_DEST}`);
@@ -108,139 +76,62 @@ function deployDocsCorpus() {
 // WH3 Process Management
 // ---------------------------------------------------------------------------
 
-let wh3Process = null;
-
-function isWh3Running() {
-  if (wh3Process && wh3Process.exitCode === null) return true;
-  // Double-check via tasklist in case the process was killed externally
+function externalWh3Running() {
+  if (process.platform !== 'win32') return false;
   try {
-    const out = execSync('tasklist /fi "IMAGENAME eq Warhammer3.exe" /nh', { encoding: 'utf8', timeout: 3000 });
-    return out.includes('Warhammer3.exe');
+    const out = execFileSync('tasklist', ['/fi', 'IMAGENAME eq Warhammer3.exe', '/nh'], {
+      encoding: 'utf8',
+      timeout: 3000,
+      windowsHide: true,
+    });
+    return /Warhammer3\.exe/i.test(out);
   } catch {
     return false;
   }
 }
 
-async function startWh3() {
-  if (isWh3Running()) return { status: 'already_running', pid: wh3Process?.pid };
-  if (!hasWh3Executable(WH3_PATH)) {
-    return {
-      status: 'executable_not_found',
-      path: WH3_PATH,
-      exe: WH3_EXE,
-      error: 'Warhammer3.exe is missing or is not a file at the selected install path',
-    };
-  }
+const processManager = new Wh3ProcessManager({
+  install: WH3_INSTALL,
+  externalProcessProbe: externalWh3Running,
+});
 
-  // WH3 reads user.script.txt from %APPDATA%/The Creative Assembly/Warhammer3/scripts/
-  // for mod loading. This file must exist and be read-only to prevent the launcher
-  // from overwriting it. It contains add_working_directory + mod lines matching
-  // the mod manager's used_mods.txt.
-  // Skip intro videos to speed up testing.
-  const args = ['--feature', 'disable_intro_videos'];
-  let child;
-  try {
-    child = spawn(WH3_EXE, args, {
-      detached: false,
-      stdio: ['ignore', 'ignore', 'pipe'],
-      cwd: WH3_PATH,
-    });
-  } catch (err) {
-    return {
-      status: 'launch_error',
-      path: WH3_PATH,
-      exe: WH3_EXE,
-      error_code: err.code ?? null,
-      error: err.message,
-    };
-  }
-
-  wh3Process = child;
-  let stderr = '';
-  child.stderr?.on('data', (chunk) => {
-    stderr = (stderr + chunk.toString()).slice(-8192);
-  });
-
-  return new Promise((resolve) => {
-    let settled = false;
-    let startupTimer = null;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(startupTimer);
-      resolve(result);
-    };
-
-    child.once('spawn', () => {
-      startupTimer = setTimeout(() => {
-        if (child.exitCode === null) {
-          finish({ status: 'started', pid: child.pid, path: WH3_PATH, exe: WH3_EXE });
-        }
-      }, 1500);
-    });
-
-    child.once('error', (err) => {
-      if (wh3Process === child) wh3Process = null;
-      finish({
-        status: err.code === 'ENOENT' ? 'executable_not_found' : 'launch_error',
-        path: WH3_PATH,
-        exe: WH3_EXE,
-        pid: child.pid ?? null,
-        error_code: err.code ?? null,
-        error: err.message,
-        stderr: stderr.trim(),
-      });
-    });
-
-    child.once('close', (code, signal) => {
-      if (wh3Process === child) wh3Process = null;
-      console.error(`[wh3-mcp] WH3 exited with code ${code}${signal ? ` (signal ${signal})` : ''}`);
-      if (stderr.trim()) console.error(`[wh3-mcp] WH3 stderr: ${stderr.trim()}`);
-      finish({
-        status: 'process_exited',
-        path: WH3_PATH,
-        exe: WH3_EXE,
-        pid: child.pid ?? null,
-        exit_code: code,
-        signal,
-        stderr: stderr.trim(),
-      });
-    });
-  });
+function isWh3Running() {
+  return processManager.isRunning();
 }
 
-function stopWh3() {
-  if (!isWh3Running()) return { status: 'not_running' };
-
-  if (wh3Process && wh3Process.exitCode === null) {
-    wh3Process.kill('SIGTERM');
-    // Wait up to 10 seconds for graceful shutdown
-    const start = Date.now();
-    while (Date.now() - start < 10000 && wh3Process.exitCode === null) {
-      // Busy-wait is fine for a CLI tool
-    }
-    if (wh3Process.exitCode === null) {
-      wh3Process.kill('SIGKILL');
-      return { status: 'force_killed' };
-    }
-    return { status: 'stopped' };
+async function startWh3() {
+  const result = await processManager.start();
+  if (result.status === 'started') {
+    await commandTransport?.reset({ quarantine: true });
+    diagnostics.beginRun(result.run_id);
+  } else if (result.status === 'already_running' && diagnostics.runId === null) {
+    diagnostics.beginRun(result.run_id ?? 'external-running');
   }
+  return result;
+}
 
-  // Kill via taskkill if our handle is stale
-  execSync('taskkill /f /im Warhammer3.exe 2>nul', { timeout: 3000 });
-  return { status: 'killed_via_taskkill' };
+async function stopWh3() {
+  const result = await processManager.stop();
+  if (result.stopped === true) await commandTransport?.reset({ quarantine: true });
+  return result;
 }
 
 function getWh3Status() {
-  const running = isWh3Running();
   return {
-    running,
-    pid: wh3Process?.pid ?? null,
-    path: WH3_PATH,
-    exe: WH3_EXE,
+    ...processManager.getStatus(),
+    install_resolution: WH3_INSTALL.ok ? { source: WH3_INSTALL.source } : {
+      code: WH3_INSTALL.code,
+      error: WH3_INSTALL.error,
+      attempts: WH3_INSTALL.attempts,
+    },
     command_file: COMMAND_FILE,
     result_file: RESULT_FILE,
     transport: commandTransport?.getStatus?.() ?? null,
+    diagnostics: {
+      session_id: diagnostics.sessionId,
+      run_id: diagnostics.runId,
+      baseline_at_ms: diagnostics.baselineAtMs,
+    },
   };
 }
 
@@ -248,14 +139,33 @@ function getWh3Status() {
 // File-based Communication (protocol v2)
 // ---------------------------------------------------------------------------
 
-const commandTransport = new CommandTransport({
+const commandTransport = WH3_PATH ? new CommandTransport({
   rootDir: WH3_PATH,
   commandFile: COMMAND_FILE,
   resultFile: RESULT_FILE,
   isGameRunning: isWh3Running,
+}) : null;
+
+const diagnostics = new DiagnosticsReader({
+  rootDir: WH3_PATH,
+  sessionId: commandTransport?.sessionId ?? `server-unconfigured-${Date.now()}`,
+});
+
+processManager.onExit((info) => {
+  commandTransport?.markGameExited(info);
 });
 
 async function sendCommand(command, params = {}, timeoutMs = 60000) {
+  if (!commandTransport) {
+    return {
+      status: 'error',
+      error: {
+        code: 'NOT_READY',
+        message: 'WH3 install path is unavailable',
+        details: { install_error: WH3_INSTALL.error, path_code: WH3_INSTALL.code },
+      },
+    };
+  }
   return commandTransport.send(command, params, timeoutMs);
 }
 
@@ -267,32 +177,7 @@ async function sendCommand(command, params = {}, timeoutMs = 60000) {
 // e.g. Shenzoo_log.txt, lua_mod_log.txt).
 // ---------------------------------------------------------------------------
 
-const ERRORS_FILE = join(WH3_PATH, 'wh3_mcp_script_errors.log');
-const ERROR_LINE = /script error|error(:| in )|traceback|assertion|attempt to|stack trace/i;
-
-function readLogTail(filePath, sinceOffset) {
-  try {
-    if (!existsSync(filePath)) return { exists: false, offset: 0, content: '' };
-    const size = statSync(filePath).size;
-    let start = Number.isFinite(sinceOffset) ? sinceOffset : 0;
-    if (start > size || start < 0) start = 0; // rotated or truncated: reread
-    const content = readFileSync(filePath).slice(start, size).toString('utf8');
-    return { exists: true, offset: size, content };
-  } catch (err) {
-    return { exists: false, offset: 0, content: '', error: err.message };
-  }
-}
-
-function newestScriptLog() {
-  try {
-    const files = readdirSync(WH3_PATH).filter(f => /^script_log_\d+_\d+\.txt$/.test(f));
-    if (!files.length) return null;
-    files.sort((a, b) => statSync(join(WH3_PATH, b)).mtimeMs - statSync(join(WH3_PATH, a)).mtimeMs);
-    return join(WH3_PATH, files[0]);
-  } catch {
-    return null;
-  }
-}
+// Diagnostics are centralized in DiagnosticsReader (disk-only; no game round-trip).
 
 // ---------------------------------------------------------------------------
 // MCP Server
@@ -323,7 +208,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'wh3_stop',
-      description: 'Kill Warhammer 3 gracefully (force kills after 10s).',
+      description: 'Stop a Warhammer 3 process launched by this MCP: request graceful termination, then use bounded force termination only if needed. An unrelated already-running WH3 process is never adopted or killed.',
       inputSchema: {
         type: 'object',
         properties: {},
@@ -1132,12 +1017,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'wh3_check_errors',
-      description: 'Read script errors and log output from disk with NO game round-trip (works even when the game is hung or closed). Sources: wh3_mcp_script_errors.log (the mod hooks the global script_error — every scripted error lands here with a turn stamp), the newest CA script_log_*.txt if CA file logging is on (error-matching lines only), plus any extra mod log files named (e.g. "Shenzoo_log.txt", "lua_mod_log.txt" — they live in the WH3 root). Pass the returned offsets back as since to get only NEW content next call. Call after a soak or any test run.',
+      description: 'Read script errors and log output from disk with NO game round-trip (works even when the game is hung or closed). Sources: wh3_mcp_script_errors.log (the mod hooks the global script_error — every scripted error lands here with a turn stamp), the newest CA script_log_*.txt if CA file logging is on (error-matching lines only), plus any extra mod log files named (e.g. "Shenzoo_log.txt", "lua_mod_log.txt" — they live in the WH3 root). Pass the returned structured cursor back as since to get only NEW content next call (legacy filename->offset maps are still accepted but are identity-indeterminate). Call after a soak or any test run.',
       inputSchema: {
         type: 'object',
         properties: {
           extra_files: { type: 'array', items: { type: 'string' }, description: 'Additional log filenames in the WH3 root to tail (max 10)' },
-          since: { type: 'object', description: 'Map of filename -> byte offset from a previous call; only content after each offset is returned' },
+          since: { type: 'object', description: 'Previous structured cursor (preferred) or legacy map of filename -> byte offset. Structured cursors detect session/run mismatch, rotation and truncation.' },
         },
       },
     },
@@ -1391,8 +1276,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case 'wh3_stop': {
-      const result = stopWh3();
-      await commandTransport.reset();
+      const result = await stopWh3();
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       };
@@ -1707,7 +1591,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       while (Date.now() - waitStart < 15000) {
         await new Promise(r => setTimeout(r, 1000));
         if (!isWh3Running()) {
-          wh3Process = null;
               return {
             content: [{ type: 'text', text: JSON.stringify({
               status: 'ok',
@@ -2003,6 +1886,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case 'wh3_soak_turns': {
+      if (!commandTransport) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: { code: 'NOT_READY', message: 'WH3 install path is unavailable' } }, null, 2) }] };
+      }
       return await commandTransport.withExclusiveLease(async () => {
         if (!isWh3Running()) {
           return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
@@ -2064,45 +1950,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case 'wh3_fight_battle': {
+      if (!commandTransport) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: { code: 'NOT_READY', message: 'WH3 install path is unavailable' } }, null, 2) }] };
+      }
       return await commandTransport.withExclusiveLease(async () => {
         if (!isWh3Running()) {
           return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
         }
         const auto = args?.auto !== false;
+        commandTransport.beginManagedTransition('fight_battle', auto ? 'campaign_after_battle' : 'battle');
         const ack = await sendCommand('fight_battle', {
           auto,
           speed: args?.speed,
           max_ticks: args?.max_ticks,
         }, 20000);
         if (ack?.status !== 'ok') {
+          commandTransport.failManagedTransition({ outcome: ack?.error?.details?.outcome ?? 'not_completed', details: ack?.error ?? ack });
           return { content: [{ type: 'text', text: JSON.stringify(ack, null, 2) }] };
         }
         // The battle context loads with a script reload (poll gap: commands go
-        // unanswered until the new instance's poll loop is up). Poll
-        // get_situation; context "battle" = ready, and for auto runs the flip
-        // back to "campaign" = done.
+        // unanswered until the new instance's poll loop is up). The exclusive
+        // lease blocks unrelated commands while this transition is active.
         const deadline = Date.now() + (args?.max_wait_s ?? 600) * 1000;
         let sawBattle = false;
         let last = ack;
         while (Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 10000));
           if (!isWh3Running()) {
+            commandTransport.markGameExited({ phase: 'fight_battle' });
             return { content: [{ type: 'text', text: JSON.stringify({
               status: 'error', error: 'WH3 process died mid-battle (CTD?) — run wh3_check_errors', last_status: last,
             }, null, 2) }] };
           }
-            const sit = await sendCommand('get_situation', {}, 20000);
-          if (sit?.status !== 'ok' || !sit.result) continue; // poll gap
+          const sit = await sendCommand('get_situation', {}, 20000);
+          if (sit?.status !== 'ok' || !sit.result) continue; // context reload poll gap
           last = sit;
           const ctx = sit.result.context;
           if (ctx === 'battle') {
             sawBattle = true;
             if (!auto) {
+              commandTransport.completeManagedTransition({ context: 'battle' });
               return { content: [{ type: 'text', text: JSON.stringify(sit, null, 2) }] };
             }
           } else if (ctx === 'campaign' && sawBattle) {
-            // Auto run finished — clear the post-battle panel and report.
-                const dis = await sendCommand('dismiss_battle_results', { captives: args?.captives }, 60000);
+            const dis = await sendCommand('dismiss_battle_results', { captives: args?.captives }, 60000);
+            commandTransport.completeManagedTransition({ context: 'campaign' });
             return { content: [{ type: 'text', text: JSON.stringify({
               status: 'ok', result: {
                 battle_fought: true,
@@ -2112,6 +2004,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }, null, 2) }] };
           }
         }
+        commandTransport.failManagedTransition({ outcome: 'unknown', details: { reason: 'battle_round_trip_timeout' } });
         return { content: [{ type: 'text', text: JSON.stringify({
           status: 'timeout',
           error: 'battle round trip did not finish before max_wait_s — the game keeps running; poll wh3_get_situation',
@@ -2184,45 +2077,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case 'wh3_check_errors': {
-      // Disk-only: works with the game hung, crashed, or closed.
-      const since = (args?.since && typeof args.since === 'object') ? args.since : {};
-      const sources = {};
-      const offsets = {};
-
-      const capName = basename(ERRORS_FILE);
-      const cap = readLogTail(ERRORS_FILE, since[capName]);
-      sources[capName] = cap;
-      offsets[capName] = cap.offset;
-
-      const scriptLog = newestScriptLog();
-      if (scriptLog) {
-        const name = basename(scriptLog);
-        const tail = readLogTail(scriptLog, since[name]);
-        const errorLines = tail.content.split(/\r?\n/).filter((l) => ERROR_LINE.test(l)).slice(0, 200);
-        sources[name] = { exists: tail.exists, offset: tail.offset, error_lines: errorLines };
-        offsets[name] = tail.offset;
-      }
-
-      const extra = Array.isArray(args?.extra_files) ? args.extra_files.slice(0, 10) : [];
-      for (const f of extra) {
-        const safe = basename(String(f)); // confine reads to the WH3 root
-        const tail = readLogTail(join(WH3_PATH, safe), since[safe]);
-        if (tail.content.length > 20000) tail.content = tail.content.slice(-20000);
-        sources[safe] = tail;
-        offsets[safe] = tail.offset;
-      }
-
-      const hasNewErrors = (cap.content && cap.content.trim().length > 0)
-        || Object.values(sources).some((s) => Array.isArray(s.error_lines) && s.error_lines.length > 0);
-      return { content: [{ type: 'text', text: JSON.stringify({
-        status: 'ok',
-        result: {
-          has_new_errors: hasNewErrors,
-          sources,
-          offsets,
-          note: 'pass offsets back as since to get only new content next call',
-        },
-      }, null, 2) }] };
+      // Disk-only: works with the game hung, crashed, or closed. Traversal and
+      // absolute paths are rejected rather than silently rewritten.
+      const result = diagnostics.check({
+        extraFiles: Array.isArray(args?.extra_files) ? args.extra_files.slice(0, 10) : [],
+        since: args?.since ?? null,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
 
     case 'wh3_build_building': {
@@ -2346,10 +2207,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  console.error(`[wh3-mcp] WH3 path: ${WH3_PATH}`);
-  console.error(`[wh3-mcp] WH3 executable: ${WH3_EXE}`);
-  console.error(`[wh3-mcp] Command file: ${COMMAND_FILE}`);
-  console.error(`[wh3-mcp] Result file: ${RESULT_FILE}`);
+  if (WH3_INSTALL.ok) {
+    console.error(`[wh3-mcp] WH3 path: ${WH3_PATH}`);
+    console.error(`[wh3-mcp] WH3 executable: ${WH3_EXE}`);
+    console.error(`[wh3-mcp] Command file: ${COMMAND_FILE}`);
+    console.error(`[wh3-mcp] Result file: ${RESULT_FILE}`);
+  } else {
+    console.error(`[wh3-mcp] WH3 path unavailable: ${WH3_INSTALL.code} - ${WH3_INSTALL.error}`);
+  }
   deployDocsCorpus();
 
   const transport = new StdioServerTransport();

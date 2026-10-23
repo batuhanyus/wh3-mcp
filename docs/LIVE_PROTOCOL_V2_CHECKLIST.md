@@ -14,3 +14,8 @@ A01-A03 are offline-verifiable but not WH3-runtime-verified by the repository te
 10. Stop/restart the MCP server while WH3 remains open. Confirm a newer handshake replaces the old server session and an older-session handshake is rejected.
 
 A crash after a command is accepted but before its result is published remains an intentionally ambiguous outcome. Protocol v2 reports that ambiguity; it does not claim transactional exactly-once game-side effects across a WH3 process crash or relaunch.
+
+11. Set `WH3_INSTALL_DIR` to the actual custom Steam install and confirm `wh3_status` reports that exact validated root. Repeat with an invalid explicit path and confirm startup reports `WH3_PATH_NOT_FOUND` rather than using a guessed fallback.
+12. Start WH3 outside MCP, then call `wh3_stop`. Confirm MCP reports the process as not owned and does not terminate it. Start WH3 through MCP and confirm graceful/forced stop outcomes reflect the real process exit.
+13. During frontend -> campaign, quit-to-menu, and battle round-trip operations, inspect `wh3_status.transport.state`; it should move through `TRANSITIONING`/`RECONNECTING` and return to `READY` only after the new Lua context handshakes.
+14. Perform two successive WH3 runs with the same MCP server. Call `wh3_check_errors` after each, passing the structured `cursor` forward. Confirm historical errors are not re-reported as current, and rotation/truncation/session mismatch is surfaced explicitly rather than as a clean result.

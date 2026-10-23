@@ -111,6 +111,13 @@ This is exactly-once **acceptance**, not a transactional guarantee over the game
 
 The reply cache is bounded; eviction never makes an old request executable again because the acceptance ledger remains authoritative.
 
+
+## Correlated context transitions
+
+Context-changing commands carry the mandatory `session_id` and `request_id` and may additionally carry `transition_id`; protocol-managed transitions also carry `transition_destination`. Lua echoes `transition_id` in the reply. A successful transition completion includes `result.transition` with the same transition identity, the expected destination, the observed context and an outcome. Node validates those fields before accepting the completion. Deferred context-transition markers persist the same identity plus the expected destination. A marker may complete a request only when its session/request/transition identity still matches the persisted accepted request; stale, duplicated or otherwise uncorrelated markers are quarantined. The persisted session ledger remembers the last completed transition identity so a copied deferred marker cannot resurrect completed work after another Lua reload.
+
+The Node transport exposes lifecycle states `READY`, `TRANSITIONING`, `RECONNECTING`, `FAILED` and `GAME_EXITED`. After a successful context reload, Node marks the old Lua instance unready and performs a fresh handshake before an ordinary command is issued. A timed-out or otherwise ambiguous state-changing operation is not automatically replayed. If reconnect lands in a context inconsistent with the expected destination, the next attempted operation receives `CONTEXT_CHANGED` and the ambiguous mutation remains unreplayed.
+
 ## Atomic publication and ownership
 
 Established filenames remain:

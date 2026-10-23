@@ -14,6 +14,11 @@ Target repository: **wh3-mcp** (the 2026-10-23 archive). W&T stays unchanged in 
 
 A01 is a prerequisite for all others. A02 and A03 must land before A05. A04 and A06 can be implemented after A01 in parallel branches, but merge only after relevant tests pass. A07 comes last.
 
+
+## WH3 install override
+
+Use `WH3_INSTALL_DIR` for a custom Warhammer III install. The older `WH3_INSTALL_PATH` variable remains accepted for compatibility. Explicit overrides are validated and never silently replaced by a guessed fallback when invalid.
+
 ## Non-negotiable rules
 
 - No fake `RUNTIME_VERIFIED` claims. Batch A is **offline-verifiable** with mocks and Node tests. The game-dependent smoke suite is documented and remains pending until actually executed on the Windows/WH3 host.

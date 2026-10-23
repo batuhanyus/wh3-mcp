@@ -74,6 +74,44 @@ test('stale session and request IDs never match the active request', () => {
   );
 });
 
+test('transition completion metadata must match identity and destination', () => {
+  const request = makeRequest({
+    sessionId: 'S1',
+    requestId: 2,
+    command: 'load_campaign',
+    params: {},
+    transitionId: 'transition-1',
+    transitionDestination: 'campaign',
+  });
+  const good = {
+    protocol: 2,
+    session_id: 'S1',
+    request_id: 2,
+    transition_id: 'transition-1',
+    status: 'ok',
+    result: {
+      transition: {
+        transition_id: 'transition-1',
+        destination: 'campaign',
+        context: 'campaign',
+        outcome: 'completed',
+      },
+    },
+  };
+  assert.equal(assertReplyMatchesRequest(good, request), good);
+  assert.throws(
+    () => assertReplyMatchesRequest({ ...good, result: {} }, request),
+    (err) => err.code === 'INVALID_RESPONSE',
+  );
+  assert.throws(
+    () => assertReplyMatchesRequest({
+      ...good,
+      result: { transition: { ...good.result.transition, destination: 'frontend' } },
+    }, request),
+    (err) => err.code === 'STALE_RESPONSE',
+  );
+});
+
 test('bounded tracker rejects duplicate IDs still in its dedupe window', () => {
   const tracker = new BoundedRequestTracker(2);
   assert.equal(tracker.accept('S1', 1), true);

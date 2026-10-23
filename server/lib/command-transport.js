@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   PROTOCOL_VERSION,
   ProtocolValidationError,
@@ -13,6 +14,15 @@ import {
 } from './protocol-v2.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const TRANSITION_DESTINATIONS = Object.freeze({
+  start_campaign: 'campaign',
+  load_campaign: 'campaign',
+  continue_campaign: 'campaign',
+  confirm_load: 'campaign',
+  quit_to_menu: 'main_menu',
+  exit_to_windows: 'game_exited',
+});
 
 function asMessage(error) {
   return error instanceof Error ? error.message : String(error);
@@ -30,10 +40,25 @@ export class CommandTransport {
     isGameRunning = () => true,
   }) {
     if (!rootDir) throw new TypeError('rootDir is required');
-    this.rootDir = rootDir;
-    this.commandFile = commandFile;
-    this.resultFile = resultFile;
-    this.quarantineDir = quarantineDir;
+    const canonicalRoot = resolve(rootDir);
+    const realRoot = existsSync(canonicalRoot) ? realpathSync(canonicalRoot) : canonicalRoot;
+    const assertInside = (candidate, label) => {
+      const canonical = resolve(candidate);
+      const rel = relative(canonicalRoot, canonical);
+      if (rel === '' && label !== 'rootDir') throw new TypeError(`${label} must be a file/directory beneath rootDir`);
+      if (rel.startsWith('..') || isAbsolute(rel)) throw new TypeError(`${label} must resolve beneath rootDir`);
+      if (existsSync(canonical)) {
+        const realCandidate = realpathSync(canonical);
+        const realRel = relative(realRoot, realCandidate);
+        if (realRel === '' && label !== 'rootDir') throw new TypeError(`${label} must be a file/directory beneath rootDir`);
+        if (realRel.startsWith('..') || isAbsolute(realRel)) throw new TypeError(`${label} resolves outside rootDir`);
+      }
+      return canonical;
+    };
+    this.rootDir = canonicalRoot;
+    this.commandFile = assertInside(commandFile, 'commandFile');
+    this.resultFile = assertInside(resultFile, 'resultFile');
+    this.quarantineDir = assertInside(quarantineDir, 'quarantineDir');
     this.sessionId = sessionId;
     this.sessionStartedAtMs = Date.now();
     this.pollIntervalMs = pollIntervalMs;
@@ -43,6 +68,10 @@ export class CommandTransport {
     this.requestCounter = 0;
     this.ready = false;
     this.luaInstance = null;
+    this.context = null;
+    this.state = 'RECONNECTING';
+    this.activeTransition = null;
+    this.lastTransition = null;
     this.initialized = false;
     this.locked = false;
     this.waiters = [];
@@ -244,7 +273,7 @@ export class CommandTransport {
     return { kind: 'match', reply };
   }
 
-  async _executeRequest(command, params, timeoutMs) {
+  async _executeRequest(command, params, timeoutMs, { transitionId = undefined, transitionDestination = undefined } = {}) {
     const requestId = this._nextRequestId();
     let request;
     try {
@@ -253,6 +282,8 @@ export class CommandTransport {
         requestId,
         command,
         params,
+        transitionId,
+        transitionDestination,
       });
     } catch (error) {
       return this._error(requestId, error.code ?? 'INVALID_REQUEST', asMessage(error), error.details);
@@ -273,7 +304,9 @@ export class CommandTransport {
 
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (!this.isGameRunning()) {
+      if (this.state === 'GAME_EXITED' || !this.isGameRunning()) {
+        this.ready = false;
+        this.state = 'GAME_EXITED';
         return this._error(requestId, 'GAME_EXITED', 'WH3 exited while the command was in flight', {
           outcome: 'unknown',
         });
@@ -311,9 +344,34 @@ export class CommandTransport {
     if (reply.status === 'ok' && reply.result?.ready === true) {
       this.ready = true;
       this.luaInstance = reply.result?.instance ?? null;
+      this.context = reply.result?.context ?? null;
+      this.state = this.activeTransition?.state === 'TRANSITIONING' ? 'TRANSITIONING' : 'READY';
+      if (this.activeTransition && ['RECONNECTING', 'FAILED'].includes(this.activeTransition.state)) {
+        const expected = this.activeTransition.destination;
+        const matches = expected === 'main_menu'
+          ? ['main_menu', 'frontend'].includes(this.context)
+          : expected === this.context;
+        this.activeTransition.reconnected_context = this.context;
+        this.activeTransition.recovered = matches;
+        this.activeTransition.state = matches ? 'READY' : 'FAILED';
+        if (!matches) this.activeTransition.outcome = this.activeTransition.outcome ?? 'unknown';
+        this.lastTransition = { ...this.activeTransition };
+        this.activeTransition = null;
+        if (!matches) {
+          this.state = 'FAILED';
+          return this._error(reply.request_id, 'CONTEXT_CHANGED', 'reconnected Lua context does not match the pending transition destination', {
+            expected_context: expected,
+            actual_context: this.context,
+            outcome: 'unknown',
+            never_replayed: true,
+          });
+        }
+      }
       return reply;
     }
     this.ready = false;
+    if (reply.error?.code === 'GAME_EXITED') this.state = 'GAME_EXITED';
+    else this.state = 'FAILED';
     return reply;
   }
 
@@ -352,24 +410,145 @@ export class CommandTransport {
         return this._error(requestId, 'IO_FAILURE', 'transport initialisation failed', { cause: asMessage(error) });
       }
 
-      if (!this.ready) {
+      if (!this.isGameRunning()) {
+        const requestId = this._nextRequestId();
+        this.ready = false;
+        this.state = 'GAME_EXITED';
+        return this._error(requestId, 'GAME_EXITED', 'WH3 is not running', { never_executed: true, outcome: 'not_executed' });
+      }
+
+      if (!this.ready || this.state === 'RECONNECTING' || this.state === 'FAILED') {
         const handshake = await this._handshake(Math.min(timeoutMs, 10000));
         if (handshake.status !== 'ok') return handshake;
       }
 
-      let reply = await this._executeRequest(command, params, timeoutMs);
+      const destination = TRANSITION_DESTINATIONS[command] ?? null;
+      const transitionId = destination ? `transition-${randomUUID()}` : undefined;
+      if (destination) {
+        this.state = 'TRANSITIONING';
+        this.activeTransition = {
+          transition_id: transitionId,
+          command,
+          destination,
+          state: 'TRANSITIONING',
+          started_at_ms: Date.now(),
+        };
+      }
+
+      let reply = await this._executeRequest(command, params, timeoutMs, {
+        transitionId,
+        transitionDestination: destination ?? undefined,
+      });
       if (reply.status === 'error' && reply.error?.code === 'NOT_READY') {
+        // Protocol v2 defines NOT_READY as a pre-dispatch rejection. Re-handshake
+        // is therefore safe; timed-out/accepted mutations are never replayed.
         this.ready = false;
+        this.state = 'RECONNECTING';
         const handshake = await this._handshake(Math.min(timeoutMs, 10000));
         if (handshake.status !== 'ok') return handshake;
-        reply = await this._executeRequest(command, params, timeoutMs);
+        reply = await this._executeRequest(command, params, timeoutMs, {
+          transitionId,
+          transitionDestination: destination ?? undefined,
+        });
       }
-      if (reply.status === 'error' && ['CONTEXT_CHANGED', 'PROTOCOL_MISMATCH'].includes(reply.error?.code)) {
+
+      if (destination) {
+        const record = this.activeTransition ?? { transition_id: transitionId, command, destination };
+        record.finished_at_ms = Date.now();
+        if (reply.status === 'error') {
+          reply.error.details = {
+            ...(reply.error.details ?? {}),
+            transition_id: transitionId,
+            destination,
+            outcome: reply.error.details?.outcome ?? 'unknown',
+          };
+        }
+        if (reply.status === 'ok') {
+          record.state = destination === 'game_exited' ? 'TRANSITIONING' : 'RECONNECTING';
+          record.outcome = 'completed';
+          this.state = destination === 'game_exited' ? 'TRANSITIONING' : 'RECONNECTING';
+          this.ready = false;
+        } else {
+          record.state = reply.error?.code === 'GAME_EXITED' ? 'GAME_EXITED' : 'FAILED';
+          record.outcome = reply.error?.details?.outcome ?? 'unknown';
+          this.state = record.state;
+          this.ready = false;
+        }
+        this.activeTransition = record;
+        this.lastTransition = { ...record };
+      } else if (reply.status === 'error' && ['CONTEXT_CHANGED', 'PROTOCOL_MISMATCH', 'GAME_EXITED'].includes(reply.error?.code)) {
         this.ready = false;
+        this.state = reply.error?.code === 'GAME_EXITED' ? 'GAME_EXITED' : 'RECONNECTING';
       }
       return reply;
     } finally {
       release();
+    }
+  }
+
+
+  beginManagedTransition(command, destination) {
+    if (this.activeTransition?.state === 'TRANSITIONING') {
+      const error = new Error('another context transition is already active');
+      error.code = 'TRANSITION_IN_PROGRESS';
+      throw error;
+    }
+    const transitionId = `transition-${randomUUID()}`;
+    this.activeTransition = {
+      transition_id: transitionId,
+      command,
+      destination,
+      state: 'TRANSITIONING',
+      started_at_ms: Date.now(),
+      managed: true,
+    };
+    this.lastTransition = { ...this.activeTransition };
+    this.state = 'TRANSITIONING';
+    return transitionId;
+  }
+
+  completeManagedTransition({ context = this.context, outcome = 'completed', details = undefined } = {}) {
+    if (!this.activeTransition) return null;
+    const record = {
+      ...this.activeTransition,
+      state: 'READY',
+      outcome,
+      completed_context: context,
+      finished_at_ms: Date.now(),
+    };
+    if (details !== undefined) record.details = details;
+    this.lastTransition = record;
+    this.activeTransition = null;
+    this.state = 'READY';
+    return record;
+  }
+
+  failManagedTransition({ outcome = 'unknown', details = undefined } = {}) {
+    if (!this.activeTransition) return null;
+    const record = {
+      ...this.activeTransition,
+      state: 'FAILED',
+      outcome,
+      finished_at_ms: Date.now(),
+    };
+    if (details !== undefined) record.details = details;
+    this.lastTransition = record;
+    this.activeTransition = null;
+    this.state = 'FAILED';
+    this.ready = false;
+    return record;
+  }
+
+  markGameExited(info = null) {
+    this.ready = false;
+    this.state = 'GAME_EXITED';
+    this.luaInstance = null;
+    this.context = null;
+    if (this.activeTransition) {
+      this.activeTransition.state = 'GAME_EXITED';
+      this.activeTransition.outcome = this.activeTransition.outcome ?? 'unknown';
+      this.activeTransition.game_exit = info;
+      this.lastTransition = { ...this.activeTransition };
     }
   }
 
@@ -378,6 +557,9 @@ export class CommandTransport {
     try {
       this.ready = false;
       this.luaInstance = null;
+      this.context = null;
+      this.state = this.isGameRunning() ? 'RECONNECTING' : 'GAME_EXITED';
+      this.activeTransition = null;
       if (quarantine) {
         try { await this._quarantine(this.commandFile, 'reset'); } catch {}
         try { await this._quarantine(this.resultFile, 'reset'); } catch {}
@@ -393,7 +575,11 @@ export class CommandTransport {
       session_id: this.sessionId,
       next_request_id: this.requestCounter + 1,
       ready: this.ready,
+      state: this.state,
       lua_instance: this.luaInstance,
+      context: this.context,
+      active_transition: this.activeTransition,
+      last_transition: this.lastTransition,
       command_file: this.commandFile,
       result_file: this.resultFile,
       queue_depth: this.waiters.filter((w) => w.active).length,
