@@ -2226,17 +2226,33 @@ end
 -- dispatch next to the other machines)
 -- ---------------------------------------------------------------------------
 
-local function finish_soak(status_str, note)
+local function finish_soak(status_str, note, stop_reason)
     soak_pending = false
     if soak then
         soak.finished = true
-        soak.status = status_str  -- "complete" | "aborted" | "error"
-        if note then soak.notes[#soak.notes + 1] = note end
+        soak.status = status_str  -- complete | aborted | blocked | timeout | error
+        soak.stop_reason = stop_reason or note or soak.stop_reason
+        if note and #soak.notes < 40 then soak.notes[#soak.notes + 1] = note end
         if soak.suppress_events then
             pcall(function() CampaignUI.SuppressAllEventTypesInUI(false) end)
         end
         debug_log("soak: finished (" .. tostring(status_str) .. ") turns=" ..
-                  tostring(soak.done) .. "/" .. tostring(soak.target))
+                  tostring(soak.done) .. "/" .. tostring(soak.target) ..
+                  " reason=" .. tostring(soak.stop_reason))
+    end
+end
+
+local function soak_record_blocker(kind, turn, detail)
+    if not soak then return end
+    if #soak.blockers < 40 then
+        soak.blockers[#soak.blockers + 1] = { kind = kind, turn = turn, detail = detail }
+    end
+end
+
+local function soak_record_decision(kind, turn, action)
+    if not soak then return end
+    if #soak.policy_decisions < 40 then
+        soak.policy_decisions[#soak.policy_decisions + 1] = { kind = kind, turn = turn, action = action }
     end
 end
 
@@ -2246,13 +2262,28 @@ local function soak_summary()
         running = soak_pending and true or false,
         finished = soak.finished and true or false,
         status = soak.status,
+        stop_reason = soak.stop_reason,
         turns_completed = soak.done,
+        completed_turns = soak.completed_turns,
         target_turns = soak.target,
         current_turn = sf(function() return cm:turn_number() end),
         events_dismissed = soak.events_dismissed,
         dilemmas_answered = soak.dilemmas_answered,
         dialogs_confirmed = soak.dialogs_confirmed,
         battles = soak.battles,
+        blockers = soak.blockers,
+        policy_decisions = soak.policy_decisions,
+        policies = {
+            battle_policy = soak.battle_policy,
+            occupation = soak.occupation,
+            dilemma_choice = soak.dilemma_choice,
+            confirm_dialogs = soak.confirm_dialogs,
+            dismiss_events = soak.dismiss_events,
+            suppress_events = soak.suppress_events,
+            permissions = soak.permission_names,
+            max_seconds_per_turn = soak.max_ticks_per_turn,
+            max_runtime_seconds = soak.max_ticks_total,
+        },
         notes = soak.notes,
         strings_ok = strings_ok(),
     }
@@ -2354,59 +2385,113 @@ local function execute_command_2(cmd, params)
         return nil  -- deferred; handle_moveopts_tick confirms any war dialog and writes the result
 
     elseif cmd == "soak_turns" then
-        -- Unattended multi-turn run. Acks IMMEDIATELY; the poll loop drives
-        -- turns in the background and soak_status reads progress + the final
-        -- summary. Per tick it clears blockers (dialogs confirmed, incidents
-        -- dismissed, dilemmas answered with a fixed choice, battles handled
-        -- per battle_policy) and ends the turn; a completed AI cycle counts
-        -- one turn. Never writes the result file from a tick.
+        -- Conservative unattended turn runner. It may end turns because the
+        -- caller explicitly requested a soak, but decision blockers stop by
+        -- default. Irreversible choices require named scenario permissions.
         if not in_campaign() then return { status = "error", error = "not in a campaign" } end
         if soak_pending then return { status = "error", error = "a soak is already running - soak_status / soak_abort" } end
         if quit_pending or autoresolve_pending or diplomacy_pending or research_pending or moveopts_pending then
             return { status = "error", error = "another deferred sequence is running" }
         end
-        local turns = tonumber(params.turns) or 5
-        if turns < 1 then turns = 1 end
-        if turns > 200 then turns = 200 end
-        local policy = params.battle_policy or "autoresolve"
+        local turns = tonumber(params.turns)
+        if turns == nil then turns = 5 end
+        if turns ~= math.floor(turns) or turns < 1 or turns > 200 then
+            return { status = "error", error = "turns must be an integer between 1 and 200" }
+        end
+        local per_turn = tonumber(params.max_seconds_per_turn) or 300
+        if per_turn ~= math.floor(per_turn) or per_turn < 5 or per_turn > 900 then
+            return { status = "error", error = "max_seconds_per_turn must be an integer between 5 and 900" }
+        end
+        local max_runtime = tonumber(params.max_runtime_seconds) or math.min(7200, math.max(60, turns * per_turn + 60))
+        if max_runtime ~= math.floor(max_runtime) or max_runtime < 1 or max_runtime > 7200 then
+            return { status = "error", error = "max_runtime_seconds must be an integer between 1 and 7200" }
+        end
+        local permission_map = {}
+        local permission_names = {}
+        if type(params.permissions) == "table" then
+            for i = 1, #params.permissions do
+                local name = tostring(params.permissions[i])
+                permission_map[name] = true
+                permission_names[#permission_names + 1] = name
+            end
+        end
+        local policy = params.battle_policy or "stop"
         if policy ~= "autoresolve" and policy ~= "retreat" and policy ~= "stop" then
             return { status = "error", error = "battle_policy must be autoresolve, retreat, or stop" }
+        end
+        if policy ~= "stop" and not permission_map.battle then
+            return { status = "error", error = "battle automation requires named permission 'battle'" }
+        end
+        if params.rig_battles and not permission_map.battle then
+            return { status = "error", error = "rig_battles requires named permission 'battle'" }
         end
         local captives = params.captives or "kill"
         if not CAPTIVE_OPTIONS[captives] then
             return { status = "error", error = "captives must be one of: kill, enslave, release" }
         end
-        local dilemma_choice = tonumber(params.dilemma_choice) or 1
-        if dilemma_choice < 1 or dilemma_choice > 4 then dilemma_choice = 1 end
+        local dilemma_choice = nil
+        if params.dilemma_choice ~= nil then
+            dilemma_choice = tonumber(params.dilemma_choice)
+            if not dilemma_choice or dilemma_choice ~= math.floor(dilemma_choice) or dilemma_choice < 1 or dilemma_choice > 4 then
+                return { status = "error", error = "dilemma_choice must be an integer from 1 to 4" }
+            end
+            if not permission_map.dilemma then
+                return { status = "error", error = "dilemma decisions require named permission 'dilemma'" }
+            end
+        end
+        local occupation = params.occupation
+        if occupation ~= nil and not permission_map.occupation then
+            return { status = "error", error = "occupation decisions require named permission 'occupation'" }
+        end
+        if params.confirm_dialogs and not permission_map.confirm_dialogs then
+            return { status = "error", error = "dialog confirmation requires named permission 'confirm_dialogs'" }
+        end
+        if params.dismiss_events and not permission_map.dismiss_events then
+            return { status = "error", error = "event dismissal requires named permission 'dismiss_events'" }
+        end
+        if params.suppress_events and not permission_map.suppress_events then
+            return { status = "error", error = "event suppression requires named permission 'suppress_events'" }
+        end
         soak = {
             target = turns, done = 0,
+            completed_turns = {},
             last_turn = sf(function() return cm:turn_number() end) or 0,
             end_turn_issued = false,
             ticks_this_turn = 0,
-            max_ticks_per_turn = tonumber(params.max_seconds_per_turn) or 300,
+            total_ticks = 0,
+            max_ticks_per_turn = per_turn,
+            max_ticks_total = max_runtime,
             dilemma_choice = dilemma_choice,
             battle_policy = policy,
             captives = captives,
-            occupation = params.occupation or "occupy",
+            occupation = occupation and tostring(occupation) or nil,
+            confirm_dialogs = params.confirm_dialogs and true or false,
+            dismiss_events = params.dismiss_events and true or false,
             rig_battles = params.rig_battles and true or false,
             suppress_events = params.suppress_events and true or false,
+            permissions = permission_map,
+            permission_names = permission_names,
             events_dismissed = 0, dilemmas_answered = 0, dialogs_confirmed = 0,
-            battles = {}, notes = {},
-            abort = false, finished = false, status = "running",
+            battles = {}, blockers = {}, policy_decisions = {}, notes = {},
+            abort = false, finished = false, status = "running", stop_reason = nil,
         }
         if soak.suppress_events then
             local ok_sup = pcall(function() CampaignUI.SuppressAllEventTypesInUI(true) end)
             if not ok_sup then
                 soak.suppress_events = false
-                soak.notes[#soak.notes + 1] = "SuppressAllEventTypesInUI unavailable - dismissing events instead"
+                finish_soak("error", "SuppressAllEventTypesInUI unavailable", "suppress_events_unavailable")
+                return { status = "error", error = "SuppressAllEventTypesInUI unavailable" }
             end
         end
         soak_pending = true
-        debug_log("soak: started for " .. turns .. " turns (policy=" .. policy .. ")")
+        debug_log("soak: started for " .. turns .. " turns (battle_policy=" .. policy .. ")")
         return { status = "ok", result = {
             started = true,
             target_turns = turns,
-            note = "runs in the background - poll soak_status; soak_abort stops it",
+            battle_policy = policy,
+            permissions = permission_names,
+            max_runtime_seconds = max_runtime,
+            note = "conservative defaults stop on decision/unknown blockers; poll soak_status; soak_abort stops it",
         } }
 
     elseif cmd == "soak_status" then
@@ -5312,82 +5397,96 @@ local function handle_soak_tick()
         return
     end
     if soak.abort then
-        finish_soak("aborted")
+        finish_soak("aborted", "manual abort requested", "manual_abort")
         return
     end
     if not in_campaign() then
-        finish_soak("error", "left campaign context mid-soak")
+        finish_soak("error", "left campaign context mid-soak", "context_changed")
         return
     end
     soak.ticks_this_turn = soak.ticks_this_turn + 1
-    if soak.ticks_this_turn > soak.max_ticks_per_turn then
-        finish_soak("error", "turn exceeded " .. soak.max_ticks_per_turn ..
-                    " ticks - a blocker the loop cannot clear?")
+    soak.total_ticks = soak.total_ticks + 1
+    if soak.total_ticks > soak.max_ticks_total then
+        finish_soak("timeout", "soak exceeded max runtime", "max_runtime_exceeded")
         return
     end
-    if soak.ticks_this_turn % 10 == 0 and not strings_ok() then
-        finish_soak("error", "string subsystem corrupted mid-soak - restart the game")
+    if soak.ticks_this_turn > soak.max_ticks_per_turn then
+        finish_soak("timeout", "turn exceeded per-turn deadline", "per_turn_deadline_exceeded")
+        return
+    end
+    if soak.total_ticks % 10 == 0 and not strings_ok() then
+        finish_soak("error", "string subsystem corrupted mid-soak - restart the game", "string_subsystem_corrupted")
         return
     end
 
     local turn = sf(function() return cm:turn_number() end) or soak.last_turn
 
-    -- 1. Pre-battle panel (queued attack landed, or the AI attacked us).
+    -- Pre-battle decisions are never automatic unless the scenario explicitly
+    -- granted the battle permission and selected a non-stop policy.
     local pre = find_panel_root("popup_pre_battle")
     if pre then
-        if soak.battle_policy == "stop" then
-            finish_soak("complete", "stopped on the pre-battle panel per battle_policy")
+        if soak.battle_policy == "stop" or not soak.permissions.battle then
+            soak_record_blocker("pre_battle", turn, "battle policy is stop or permission is absent")
+            finish_soak("blocked", "stopped on pre-battle decision", "pre_battle")
             return
         end
-        local handled = false
         if soak.battle_policy == "retreat" then
             local set = get_pre_battle_set(pre)
             local btn = get_pre_battle_button(set, "retreat")
             if btn and uic_visible(btn) and safe_click(btn) then
                 soak.battles[#soak.battles + 1] = { turn = turn, action = "retreated" }
-                handled = true
+                soak_record_decision("battle", turn, "retreat")
+                return
+            end
+            soak_record_blocker("pre_battle", turn, "retreat requested but unavailable")
+            finish_soak("blocked", "retreat was unavailable; autoresolve was not substituted", "retreat_unavailable")
+            return
+        end
+        if soak.rig_battles then
+            local ok_pb, active = pcall(function() return cm:is_pending_battle_active() end)
+            if ok_pb and active then
+                local f = get_local_faction()
+                local fk = f and sf(function() return f:name() end) or nil
+                if fk then pcall(function() cm:win_next_autoresolve_battle(fk) end) end
             end
         end
-        if not handled then
-            -- Autoresolve (also the fallback when retreat is not offered).
-            if soak.rig_battles then
-                local ok_pb, active = pcall(function() return cm:is_pending_battle_active() end)
-                if ok_pb and active then
-                    local f = get_local_faction()
-                    local fk = f and sf(function() return f:name() end) or nil
-                    -- CTD guard: only with an active pending battle (see autoresolve_battle).
-                    if fk then pcall(function() cm:win_next_autoresolve_battle(fk) end) end
-                end
-            end
-            local set = get_pre_battle_set(pre)
-            local btn = get_pre_battle_button(set, "autoresolve")
-            if btn and safe_click(btn) then
-                autoresolve_captives = soak.captives
-                autoresolve_rigged = soak.rig_battles
-                autoresolve_title = nil
-                autoresolve_clicked = nil
-                autoresolve_stage = "await_results"
-                autoresolve_ticks = 0
-                local battle_turn = turn
-                autoresolve_on_done = function(res)
-                    local entry = { turn = battle_turn, action = "autoresolved" }
-                    if res and res.result then
-                        entry.human_victory = res.result.human_victory
-                        entry.result_title = res.result.result_title
-                    elseif res and res.error then
-                        entry.error = res.error
-                    end
-                    soak.battles[#soak.battles + 1] = entry
-                end
-                autoresolve_pending = true
-            end
+        local set = get_pre_battle_set(pre)
+        local btn = get_pre_battle_button(set, "autoresolve")
+        if not btn or not safe_click(btn) then
+            soak_record_blocker("pre_battle", turn, "autoresolve button unavailable")
+            finish_soak("blocked", "autoresolve could not be started", "autoresolve_unavailable")
+            return
         end
+        soak_record_decision("battle", turn, soak.rig_battles and "autoresolve_rigged" or "autoresolve")
+        autoresolve_captives = soak.captives
+        autoresolve_rigged = soak.rig_battles
+        autoresolve_title = nil
+        autoresolve_clicked = nil
+        autoresolve_stage = "await_results"
+        autoresolve_ticks = 0
+        local battle_turn = turn
+        autoresolve_on_done = function(res)
+            local entry = { turn = battle_turn, action = "autoresolved" }
+            if res and res.result then
+                entry.human_victory = res.result.human_victory
+                entry.result_title = res.result.result_title
+            elseif res and res.error then
+                entry.error = res.error
+            end
+            soak.battles[#soak.battles + 1] = entry
+        end
+        autoresolve_pending = true
         return
     end
 
-    -- 2. A results panel with no machine armed (e.g. a battle resolved before
-    -- the soak started): run the dismiss stages of the autoresolve machine.
+    -- A pre-existing results panel can imply a captive choice. Treat it as a
+    -- battle decision and require the same named permission.
     if not autoresolve_pending and find_panel_root("popup_battle_results") then
+        if not soak.permissions.battle then
+            soak_record_blocker("battle_results", turn, "battle permission is absent")
+            finish_soak("blocked", "battle results require an explicit scenario permission", "battle_results")
+            return
+        end
         autoresolve_captives = soak.captives
         autoresolve_rigged = false
         autoresolve_title = nil
@@ -5403,16 +5502,19 @@ local function handle_soak_tick()
             end
             soak.battles[#soak.battles + 1] = entry
         end
+        soak_record_decision("battle_results", turn, "dismiss_with_captives_" .. tostring(soak.captives))
         autoresolve_pending = true
         return
     end
 
-    -- 2b. Occupation choice after a settlement was taken: decide per the
-    -- soak's occupation policy (default "occupy") so the soak never stalls
-    -- on a capture.
     local occupation = read_settlement_captured()
     if occupation then
-        local want = (soak.occupation or "occupy"):lower()
+        if not soak.permissions.occupation or not soak.occupation then
+            soak_record_blocker("occupation", turn, tostring(occupation.settlement))
+            finish_soak("blocked", "occupation decision requires explicit permission and requested choice", "occupation")
+            return
+        end
+        local want = soak.occupation:lower()
         local want_pat = escape_pattern(want)
         local picked = nil
         for i = 1, #occupation.options do
@@ -5425,21 +5527,29 @@ local function handle_soak_tick()
                 if t:find(want_pat) then picked = occupation.options[i] break end
             end
         end
-        picked = picked or occupation.options[1]
-        if picked then
-            local root = find_root_child("settlement_captured")
-            local opt = root and get_child(get_child(root, "button_parent"), picked.id) or nil
-            local btn = opt and get_child(opt, "option_button") or nil
-            if btn and safe_click(btn) then
-                soak.notes[#soak.notes + 1] = "turn " .. tostring(turn) .. " captured " ..
-                    tostring(occupation.settlement) .. ": " .. tostring(picked.text)
-            end
+        if not picked then
+            soak_record_blocker("occupation", turn, "requested option not present: " .. tostring(soak.occupation))
+            finish_soak("blocked", "requested occupation option was unavailable", "occupation_option_unavailable")
+            return
+        end
+        local root = find_root_child("settlement_captured")
+        local opt = root and get_child(get_child(root, "button_parent"), picked.id) or nil
+        local btn = opt and get_child(opt, "option_button") or nil
+        if not btn or not safe_click(btn) then
+            soak_record_blocker("occupation", turn, "requested option could not be clicked")
+            finish_soak("blocked", "occupation option click failed", "occupation_click_failed")
+            return
+        end
+        soak_record_decision("occupation", turn, tostring(picked.text))
+        if #soak.notes < 40 then
+            soak.notes[#soak.notes + 1] = "turn " .. tostring(turn) .. " captured " ..
+                tostring(occupation.settlement) .. ": " .. tostring(picked.text)
         end
         return
     end
 
-    -- 2c. A move_options interruption ("Declare War?"): the soak never wants
-    -- side-effect wars, so cancel the move (the last visible bar).
+    -- Move-options may offer Declare War. Always cancel the move instead of
+    -- granting diplomacy side effects; the original move is deliberately not retried.
     local mo = get_move_options_root()
     if mo then
         local panel = get_child(mo, "panel")
@@ -5449,69 +5559,111 @@ local function handle_soak_tick()
             if bar and uic_visible(bar) then last = bar break end
         end
         if last and safe_click(last) then
-            soak.notes[#soak.notes + 1] = "turn " .. tostring(turn) .. " move_options cancelled"
+            soak_record_decision("move_options", turn, "cancelled")
+            if #soak.notes < 40 then soak.notes[#soak.notes + 1] = "turn " .. tostring(turn) .. " move_options cancelled" end
+            return
         end
+        soak_record_blocker("move_options", turn, "cancel option unavailable")
+        finish_soak("blocked", "move-options blocker could not be safely cancelled", "move_options")
         return
     end
 
-    -- 3. Confirmation dialogs (end-turn warnings and the like): confirm.
     local dlg = get_visible_dialogue_box()
     if dlg then
+        if not soak.confirm_dialogs or not soak.permissions.confirm_dialogs then
+            soak_record_blocker("dialog", turn, "confirmation not permitted")
+            finish_soak("blocked", "confirmation dialog requires explicit permission", "dialog")
+            return
+        end
         if click_dialog_button(dlg, "tick") then
             soak.dialogs_confirmed = soak.dialogs_confirmed + 1
+            soak_record_decision("dialog", turn, "confirmed")
+            return
         end
+        soak_record_blocker("dialog", turn, "confirm button unavailable")
+        finish_soak("blocked", "dialog could not be confirmed", "dialog_click_failed")
         return
     end
 
-    -- 4. Event panels: answer dilemmas with the configured choice, dismiss
-    -- everything else.
     local events = find_panel_root("events")
     if events then
         local detail = read_event_detail()
         if detail and detail.event_type == "dilemma" then
+            if not soak.dilemma_choice or not soak.permissions.dilemma then
+                soak_record_blocker("dilemma", turn, detail.title)
+                finish_soak("blocked", "dilemma requires explicit permission and choice", "dilemma")
+                return
+            end
             local dilemma = get_open_dilemma(events)
             local list = dilemma and get_child(dilemma, "dilemma_list") or nil
             local entry = list and find_dilemma_choice(list, soak.dilemma_choice) or nil
-            if not entry and list and soak.dilemma_choice ~= 1 then
-                entry = find_dilemma_choice(list, 1)  -- fewer choices than configured
-            end
             local btn = entry and get_child(entry, "choice_button") or nil
-            if btn and safe_click(btn) then
-                soak.dilemmas_answered = soak.dilemmas_answered + 1
-                if #soak.notes < 30 and detail.title then
-                    soak.notes[#soak.notes + 1] = "turn " .. tostring(turn) .. " dilemma: " .. tostring(detail.title)
-                end
+            if not btn or not safe_click(btn) then
+                soak_record_blocker("dilemma", turn, "requested choice unavailable")
+                finish_soak("blocked", "requested dilemma choice was unavailable", "dilemma_choice_unavailable")
+                return
             end
-        else
-            local button_set = get_child(events, "button_set")
-            local holder = button_set and get_child(button_set, "accept_holder") or nil
-            local btn = holder and get_child(holder, "button_accept") or get_child(events, "button_accept")
-            if btn and safe_click(btn) then
-                soak.events_dismissed = soak.events_dismissed + 1
+            soak.dilemmas_answered = soak.dilemmas_answered + 1
+            soak_record_decision("dilemma", turn, "choice_" .. tostring(soak.dilemma_choice))
+            if #soak.notes < 40 and detail.title then
+                soak.notes[#soak.notes + 1] = "turn " .. tostring(turn) .. " dilemma: " .. tostring(detail.title)
             end
+            return
         end
+        if not soak.dismiss_events or not soak.permissions.dismiss_events then
+            soak_record_blocker("event", turn, detail and detail.title or "event panel")
+            finish_soak("blocked", "event dismissal requires explicit permission", "event")
+            return
+        end
+        local button_set = get_child(events, "button_set")
+        local holder = button_set and get_child(button_set, "accept_holder") or nil
+        local btn = holder and get_child(holder, "button_accept") or get_child(events, "button_accept")
+        if btn and safe_click(btn) then
+            soak.events_dismissed = soak.events_dismissed + 1
+            soak_record_decision("event", turn, "dismissed")
+            return
+        end
+        soak_record_blocker("event", turn, "dismiss button unavailable")
+        finish_soak("blocked", "event could not be dismissed", "event_click_failed")
         return
     end
 
-    -- 5. Drive the turn.
+    -- Anything else that get_situation considers blocking is unknown to the
+    -- soak policy. Stop with evidence instead of inventing a click path.
+    local situation = build_situation()
+    if situation and situation.blocking_count and situation.blocking_count > 0 then
+        local first = situation.blocking and situation.blocking[1] or nil
+        local kind = first and first.kind or "unknown"
+        soak_record_blocker(kind, turn, first)
+        finish_soak("blocked", "unexpected blocker: " .. tostring(kind), "unknown_blocker")
+        return
+    end
+
     local my_turn = sf(function() return cm:is_local_players_turn() end)
     if my_turn then
         if turn > soak.last_turn then
             soak.done = soak.done + 1
+            soak.completed_turns[#soak.completed_turns + 1] = turn
             soak.last_turn = turn
             soak.end_turn_issued = false
             soak.ticks_this_turn = 0
             debug_log("soak: turn " .. turn .. " reached (" .. soak.done .. "/" .. soak.target .. ")")
             if soak.done >= soak.target then
-                finish_soak("complete")
+                finish_soak("complete", nil, "target_turns_completed")
                 return
             end
         end
-        -- Re-issue every 15 ticks in case the first call was swallowed by a
-        -- blocker that has since been cleared.
-        if not soak.end_turn_issued or soak.ticks_this_turn % 15 == 0 then
+        -- Never blindly retry a turn-changing command. One end_turn call is
+        -- issued for each confirmed player turn; lack of progress hits the
+        -- per-turn deadline and remains reportable through soak_status.
+        if not soak.end_turn_issued then
             local ok_et = pcall(function() cm:end_turn() end)
-            if ok_et then soak.end_turn_issued = true end
+            if ok_et then
+                soak.end_turn_issued = true
+                soak_record_decision("turn", turn, "end_turn_issued")
+            else
+                finish_soak("error", "cm:end_turn failed", "end_turn_failed")
+            end
         end
     end
 end

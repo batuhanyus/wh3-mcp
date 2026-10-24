@@ -188,9 +188,16 @@ Test levers (instant cheats for setting up a test state):
 
 Soak testing:
   soak_turns {turns, battle_policy?, rig_battles?, captives?,
-      dilemma_choice?, occupation?, suppress_events?, max_seconds_per_turn?}
-      Plays N turns unattended, auto-answering everything. Acks at once;
-      poll soak_status {} every ~10 s until finished. soak_abort {} stops it.
+      dilemma_choice?, occupation?, confirm_dialogs?, dismiss_events?,
+      suppress_events?, permissions?, max_seconds_per_turn?,
+      max_runtime_seconds?}
+      Bounded conservative turn runner. Acks at once; poll soak_status until
+      finished and use soak_abort to stop it. Default battle_policy is stop.
+      Decision automation is NOT implicit: battle, dilemma, occupation,
+      confirm_dialogs, dismiss_events and suppress_events each require the
+      matching name in permissions. Unknown/advisor/mission/etc. blockers
+      stop with evidence. retreat never silently falls back to autoresolve.
+      end_turn is issued once per confirmed player turn, not blindly retried.
 
 Discovery and debug:
   cm_search {query, limit?, context?}    (see section 9)
@@ -203,6 +210,9 @@ Discovery and debug:
       0..8, nodes 1..256. Unsupported fields are null with API_UNSUPPORTED.
   click_ui {path}                        dump_children {path, child_index?}
   take_screenshot {filename?}            probe_cm {}
+      Raw Lua capture writes the requested TGA. Prefer Node wh3_screenshot,
+      which supplies a unique session/run filename, waits for a fresh stable
+      file, converts/verifies PNG and returns agent-readable image content.
 
 
 6. BATTLE MAP

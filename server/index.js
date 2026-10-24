@@ -25,15 +25,20 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { execFileSync } from 'node:child_process';
 import { existsSync, copyFileSync, statSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'url';
 import { CommandTransport } from './lib/command-transport.js';
 import { DiagnosticsReader } from './lib/diagnostics.js';
 import { normalizeUiInspectionArgs } from './lib/ui-inspection.js';
 import { waitForConditions } from './lib/wait-for.js';
+import { ScreenshotArtifactManager } from './lib/screenshot-artifacts.js';
+import { SessionEvidenceManager } from './lib/session-evidence.js';
+import { normalizeSoakArgs, runSoak, SOAK_PERMISSIONS } from './lib/soak.js';
 import { resolveBeneathRoot, resolveWh3Install, Wh3ProcessManager } from './lib/wh3-runtime.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const SOURCE_REPO_ROOT = resolve(__dirname, '..');
+const SERVER_VERSION = '0.1.0';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -158,8 +163,10 @@ processManager.onExit((info) => {
 });
 
 async function sendCommand(command, params = {}, timeoutMs = 60000) {
+  const startedAtMs = Date.now();
+  let reply;
   if (!commandTransport) {
-    return {
+    reply = {
       status: 'error',
       error: {
         code: 'NOT_READY',
@@ -167,9 +174,51 @@ async function sendCommand(command, params = {}, timeoutMs = 60000) {
         details: { install_error: WH3_INSTALL.error, path_code: WH3_INSTALL.code },
       },
     };
+  } else {
+    reply = await commandTransport.send(command, params, timeoutMs);
   }
-  return commandTransport.send(command, params, timeoutMs);
+  sessionEvidence?.recordCommand(command, reply, { startedAtMs, endedAtMs: Date.now() });
+  return reply;
 }
+
+const screenshotArtifacts = new ScreenshotArtifactManager({
+  rootDir: WH3_PATH,
+  sourceRepoRoot: SOURCE_REPO_ROOT,
+  sessionId: commandTransport?.sessionId ?? `server-unconfigured-${Date.now()}`,
+  getRunId: () => processManager.getStatus().run_id ?? diagnostics.runId,
+  isGameRunning: isWh3Running,
+  sendCommand,
+});
+
+const sessionEvidence = new SessionEvidenceManager({
+  sourceRepoRoot: SOURCE_REPO_ROOT,
+  getIdentity: () => {
+    const processStatus = processManager.getStatus();
+    const transport = commandTransport?.getStatus?.() ?? null;
+    return {
+      running: processStatus.running,
+      owned: processStatus.owned,
+      pid: processStatus.pid ?? null,
+      run_id: processStatus.run_id ?? diagnostics.runId ?? null,
+      session_id: transport?.session_id ?? diagnostics.sessionId,
+      transport_state: transport?.state ?? null,
+      next_request_id: transport?.next_request_id ?? null,
+      context: transport?.context ?? null,
+    };
+  },
+  getVersions: () => {
+    const transport = commandTransport?.getStatus?.() ?? null;
+    return {
+      server_version: SERVER_VERSION,
+      protocol: transport?.protocol ?? 2,
+      lua_script_version: transport?.script_version ?? null,
+    };
+  },
+  getDiagnostics: ({ extraFiles = [], since = null } = {}) => diagnostics.check({ extraFiles, since }),
+  getSituation: () => sendCommand('get_situation', {}, 15000),
+});
+
+let lastSoakReport = null;
 
 // ---------------------------------------------------------------------------
 // Script-error surfacing — read log files straight from disk, no game
@@ -222,6 +271,38 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {},
+      },
+    },
+    {
+      name: 'wh3_begin_test_session',
+      description: 'Begin a bounded evidence session tied to the current MCP transport/process run. Captures a fresh log boundary and starting get_situation observation; it does not declare anything RUNTIME_VERIFIED.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          label: { type: 'string', description: 'Optional short scenario/test label.' },
+          extra_files: { type: 'array', items: { type: 'string' }, description: 'Optional extra WH3-root log files to include in the per-session diagnostic boundary (max 10).' },
+          capture_start_screenshot: { type: 'boolean', description: 'Also capture a fresh screenshot artifact after the session begins (default false).' },
+        },
+      },
+    },
+    {
+      name: 'wh3_end_test_session',
+      description: 'End the active evidence session with an ending get_situation observation and fresh diagnostics since its starting log cursor. Does not grant RUNTIME_VERIFIED status.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          capture_end_screenshot: { type: 'boolean', description: 'Capture a fresh screenshot artifact before ending the session (default false).' },
+        },
+      },
+    },
+    {
+      name: 'wh3_export_evidence',
+      description: 'Atomically export the current/last test-session evidence manifest plus bounded command and diagnostic documents. Returns compact paths/synopsis, not unbounded logs or image bytes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          include_active: { type: 'boolean', description: 'Allow a snapshot export while a session is still active (default true).' },
+        },
       },
     },
     {
@@ -534,15 +615,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'wh3_screenshot',
-      description: 'Take a screenshot in-game via common.take_screenshot().',
+      description: 'Capture a fresh in-game screenshot, wait for a new stable TGA, convert it to a verified PNG artifact, and return the PNG as MCP image content when within the inline size limit. The legacy filename argument is now a basename/prefix; the actual capture filename is always unique and correlated to session/run identity.',
       inputSchema: {
         type: 'object',
         properties: {
           filename: {
             type: 'string',
-            description: 'Screenshot filename (default wh3_mcp_screenshot.tga)',
+            description: 'Legacy-compatible basename/prefix (default wh3_mcp_screenshot.tga). Paths are rejected; the actual TGA filename is unique per request.',
             default: 'wh3_mcp_screenshot.tga',
           },
+          timeout_ms: { type: 'number', description: 'Bounded wait for the newly-created screenshot file to become stable (500..30000 ms).' },
         },
       },
     },
@@ -1076,18 +1158,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'wh3_soak_turns',
-      description: 'Unattended multi-turn soak: end turns in a loop, auto-clearing everything that blocks (dialogs confirmed, incidents dismissed, dilemmas answered with a fixed choice, battles per battle_policy) and logging what happened. THE regression-test tool: run N turns over a mod and read the summary (turns done, events/dilemmas/battles handled, notes) plus wh3_check_errors afterwards. This call BLOCKS until the soak finishes (server polls the mod every 10s). Do not drive the campaign with other tools while it runs; wh3_soak_abort stops it early.',
+      description: 'Bounded conservative multi-turn soak. Ending turns is the requested scenario action; decision blockers STOP by default. Battles, dilemmas, occupation choices, dialog confirmation, event dismissal/suppression require explicit named permissions. The call blocks while polling but preserves partial reporting on abort, timeout or process exit.',
       inputSchema: {
         type: 'object',
         properties: {
-          turns: { type: 'number', description: 'Full turn cycles to run (default 5, cap 200)' },
-          battle_policy: { type: 'string', enum: ['autoresolve', 'retreat', 'stop'], description: 'What to do when a battle blocks: autoresolve it (default; real outcome unless rig_battles), retreat when offered (falls back to autoresolve), or stop the soak there' },
-          rig_battles: { type: 'boolean', description: 'Rig every autoresolved battle as a win via cm:win_next_autoresolve_battle (CTD-guarded). Default false = real outcomes.' },
-          captives: { type: 'string', enum: ['kill', 'enslave', 'release'], description: 'Captive choice after won battles (default kill)' },
-          dilemma_choice: { type: 'number', description: 'Fixed 1-based choice for every dilemma (default 1; falls back to 1 when a dilemma has fewer choices)' },
-          occupation: { type: 'string', description: 'Occupation choice when a settlement is captured mid-soak, matched against the option texts (default "occupy")' },
-          suppress_events: { type: 'boolean', description: 'Suppress event UI entirely via CampaignUI.SuppressAllEventTypesInUI instead of dismissing per event. Default false — dismissal counts are test evidence.' },
-          max_seconds_per_turn: { type: 'number', description: 'Abort if one turn takes longer than this (default 300)' },
+          turns: { type: 'number', description: 'Positive integer full turn cycles (default 5, max 200). Zero is rejected instead of silently becoming one.' },
+          battle_policy: { type: 'string', enum: ['autoresolve', 'retreat', 'stop'], description: 'Default stop. autoresolve/retreat require permissions:["battle"]. Retreat no longer silently falls back to autoresolve.' },
+          rig_battles: { type: 'boolean', description: 'Rig explicitly-permitted autoresolves as wins. Requires battle permission.' },
+          captives: { type: 'string', enum: ['kill', 'enslave', 'release'], description: 'Captive choice used only when battle automation is explicitly permitted (default kill).' },
+          dilemma_choice: { type: 'number', description: 'Explicit 1-based dilemma choice (1..4). Requires permissions:["dilemma"]. Omit to stop on dilemmas.' },
+          occupation: { type: 'string', description: 'Explicit occupation option text. Requires permissions:["occupation"]. Omit to stop on settlement capture.' },
+          confirm_dialogs: { type: 'boolean', description: 'Allow generic confirmation-dialog clicks. Requires permissions:["confirm_dialogs"]. Default false.' },
+          dismiss_events: { type: 'boolean', description: 'Allow dismissing non-dilemma event UI. Requires permissions:["dismiss_events"]. Default false.' },
+          suppress_events: { type: 'boolean', description: 'Suppress event UI for the run. Requires permissions:["suppress_events"]. Default false.' },
+          permissions: { type: 'array', items: { type: 'string', enum: SOAK_PERMISSIONS }, description: 'Named scenario permissions for potentially consequential automatic actions.' },
+          max_seconds_per_turn: { type: 'number', description: 'Per-turn deadline, integer 5..900 seconds (default 300).' },
+          max_runtime_seconds: { type: 'number', description: 'Overall soak deadline, integer 1..7200 seconds. Defaults to a finite bound derived from turn count/deadline.' },
         },
       },
     },
@@ -1375,6 +1461,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       };
     }
 
+    case 'wh3_begin_test_session': {
+      const result = await sessionEvidence.begin({
+        label: args?.label,
+        extraFiles: Array.isArray(args?.extra_files) ? args.extra_files : [],
+      });
+      if (result.status === 'ok' && args?.capture_start_screenshot === true && isWh3Running()) {
+        const capture = await screenshotArtifacts.capture({ filename: 'session-start.tga' });
+        if (capture.status === 'ok') sessionEvidence.recordArtifact(capture.result);
+        result.result.start_screenshot = capture.status === 'ok'
+          ? { capture_id: capture.result.capture_id, artifact: capture.result.artifact }
+          : { status: 'error', error: capture.error };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
+    case 'wh3_end_test_session': {
+      let capture = null;
+      if (args?.capture_end_screenshot === true && isWh3Running()) {
+        capture = await screenshotArtifacts.capture({ filename: 'session-end.tga' });
+        if (capture.status === 'ok') sessionEvidence.recordArtifact(capture.result);
+      }
+      const result = await sessionEvidence.end();
+      if (result.status === 'ok' && capture) {
+        result.result.end_screenshot = capture.status === 'ok'
+          ? { capture_id: capture.result.capture_id, artifact: capture.result.artifact }
+          : { status: 'error', error: capture.error };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
+    case 'wh3_export_evidence': {
+      const result = await sessionEvidence.exportEvidence({ includeActive: args?.include_active !== false });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
     case 'wh3_ping': {
       const result = await sendCommand('ping', {}, 10000);
       return {
@@ -1422,13 +1543,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
 
     case 'wh3_screenshot': {
-      if (!isWh3Running()) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
-      }
-      const result = await sendCommand('take_screenshot', {
+      const result = await screenshotArtifacts.capture({
         filename: args?.filename ?? 'wh3_mcp_screenshot.tga',
-      }, 10000);
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        timeout_ms: args?.timeout_ms,
+      });
+      if (result.status !== 'ok') {
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+      sessionEvidence.recordArtifact(result.result);
+      const { _png, ...metadata } = result.result;
+      const content = [{ type: 'text', text: JSON.stringify({ status: 'ok', result: metadata }, null, 2) }];
+      if (metadata.artifact.inline && Buffer.isBuffer(_png)) {
+        content.push({ type: 'image', data: _png.toString('base64'), mimeType: 'image/png' });
+      }
+      return { content };
     }
 
     case 'wh3_load_campaign': {
@@ -2017,61 +2145,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       if (!commandTransport) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: { code: 'NOT_READY', message: 'WH3 install path is unavailable' } }, null, 2) }] };
       }
-      return await commandTransport.withExclusiveLease(async () => {
-        if (!isWh3Running()) {
-          return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
-        }
-        const ack = await sendCommand('soak_turns', {
-          turns: args?.turns,
-          battle_policy: args?.battle_policy,
-          rig_battles: args?.rig_battles,
-          captives: args?.captives,
-          dilemma_choice: args?.dilemma_choice,
-          occupation: args?.occupation,
-          suppress_events: args?.suppress_events,
-          max_seconds_per_turn: args?.max_seconds_per_turn,
-        }, 15000);
-        if (ack?.status !== 'ok') {
-          return { content: [{ type: 'text', text: JSON.stringify(ack, null, 2) }] };
-        }
-        // The mod acks immediately and runs the soak in its poll loop; poll
-        // soak_status here until it reports finished (or the deadline passes).
-        const soakTurns = args?.turns ?? 5;
-        const perTurnMs = (args?.max_seconds_per_turn ?? 300) * 1000;
-        const deadline = Date.now() + soakTurns * perTurnMs + 60000;
-        let lastStatus = ack;
-        while (Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 10000));
-          if (!isWh3Running()) {
-            return { content: [{ type: 'text', text: JSON.stringify({
-              status: 'error', error: 'WH3 process died mid-soak (CTD?) — run wh3_check_errors', last_status: lastStatus,
-            }, null, 2) }] };
-          }
-            const st = await sendCommand('soak_status', {}, 20000);
-          if (st?.status === 'ok' && st.result) {
-            lastStatus = st;
-            if (st.result.finished || !st.result.running) {
-              return { content: [{ type: 'text', text: JSON.stringify(st, null, 2) }] };
-            }
-          }
-        }
-        return { content: [{ type: 'text', text: JSON.stringify({
-          status: 'timeout', error: 'soak did not finish before the server-side deadline — wh3_soak_status / wh3_soak_abort still work', last_status: lastStatus,
-        }, null, 2) }] };
-      }, { allowCommands: ['soak_status', 'soak_abort'] });
+      let normalized;
+      try { normalized = normalizeSoakArgs(args ?? {}); }
+      catch (error) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: { code: error.code ?? 'INVALID_SOAK_ARGUMENTS', message: error.message } }, null, 2) }] };
+      }
+      try {
+        const result = await commandTransport.withExclusiveLease(async () => runSoak(normalized, {
+          sendCommand,
+          isRunning: isWh3Running,
+          onProgress: (report) => { lastSoakReport = report; },
+        }), { allowCommands: ['soak_status', 'soak_abort'] });
+        lastSoakReport = result;
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        const result = { status: 'error', error: { code: 'SOAK_LEASE_FAILED', message: error?.message ?? String(error) } };
+        lastSoakReport = result;
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
     }
 
     case 'wh3_soak_status': {
       if (!isWh3Running()) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
+        const cached = lastSoakReport ?? { status: 'error', error: { code: 'PROCESS_EXITED', message: 'WH3 is not running and no cached soak report is available' } };
+        return { content: [{ type: 'text', text: JSON.stringify({ ...cached, report_source: lastSoakReport ? 'server_cached' : 'none' }, null, 2) }] };
       }
       const soakStatus = await sendCommand('soak_status', {}, 20000);
+      if (soakStatus?.status === 'ok') lastSoakReport = soakStatus;
       return { content: [{ type: 'text', text: JSON.stringify(soakStatus, null, 2) }] };
     }
 
     case 'wh3_soak_abort': {
       if (!isWh3Running()) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'WH3 not running' }, null, 2) }] };
+        const result = lastSoakReport ?? { status: 'error', error: { code: 'PROCESS_EXITED', message: 'WH3 is not running' } };
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
       const soakAbort = await sendCommand('soak_abort', {}, 20000);
       return { content: [{ type: 'text', text: JSON.stringify(soakAbort, null, 2) }] };

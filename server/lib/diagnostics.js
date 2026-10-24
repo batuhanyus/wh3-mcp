@@ -268,6 +268,8 @@ export class DiagnosticsReader {
       decodedParts.push(split.complete.toString('utf8'));
     }
     const text = decodedParts.join(ranges.truncated ? '\n...[unread bytes]...\n' : '');
+    const readHash = createHash('sha256');
+    for (const chunk of ranges.chunks) readHash.update(chunk.buffer);
     const lines = text.split(/\r?\n/);
     const matches = allLinesAreErrors
       ? lines.filter((line) => line.trim().length > 0)
@@ -288,6 +290,7 @@ export class DiagnosticsReader {
       rotated,
       size_shrunk: truncatedFromCursor,
       read_bytes: ranges.bytesRead,
+      read_sha256: ranges.bytesRead > 0 ? readHash.digest('hex') : null,
       unread_bytes: ranges.skippedBytes,
       read_truncated: ranges.truncated,
       output_truncated: compact.output_truncated,

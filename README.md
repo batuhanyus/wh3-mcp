@@ -112,6 +112,57 @@ Example campaign/UI readiness wait:
 
 `wh3_wait_for` is read-only. A blocker is observed, never auto-dismissed; the tool will not answer dilemmas, move armies or otherwise manufacture progress. It is also the wrong tool for a state that the scenario itself never triggers. For example, waiting for a settlement panel to become visible is pointless if no preceding action opens/selects a settlement. Use a deliberate action first, then wait for the resulting observable state.
 
+## Screenshot artifacts
+
+`wh3_screenshot` is a fresh-capture artifact operation, not a filename existence check. Every request creates a unique TGA basename containing the active transport session, WH3 run identity and capture id. The server waits for that exact new file to become non-zero and stable before reading it, then records timestamps, dimensions and SHA-256 evidence. An old `wh3_mcp_screenshot.tga` can therefore never satisfy a new call.
+
+The server contains a bounded TGA converter for the true-colour formats WH3 emits (24/32-bit, uncompressed or RLE) and verifies the PNG signature/dimensions after conversion. No ImageMagick/Pillow installation is required. Unsupported/malformed input is returned as `CONVERSION_ERROR` with the original TGA metadata/hash rather than being presented as PNG data. `PROCESS_EXITED`, `SCREENSHOT_MISSING`, `SCREENSHOT_TIMEOUT`, conversion failure and size-limit failure remain distinct outcomes.
+
+Successful PNGs are stored under `WH3_MCP_ARTIFACT_DIR` when configured; otherwise the OS temporary directory is used. Repository-local artifact directories are rejected. Cleanup is bounded (24-hour retention and a 200-file ceiling by default). PNGs up to 8 MiB are also emitted as MCP `image/png` content so an agent can actually inspect them; larger valid artifacts remain on disk and return metadata without stuffing unbounded base64 into MCP JSON.
+
+The historical `filename` argument is retained as a basename/prefix only. Paths are rejected and the exact requested filename is no longer reused. This is the deliberate migration needed to prevent stale captures. `tools/screenshot.ps1` remains a host-side desktop PNG fallback for manual foreground inspection; by default it also generates a unique temporary output and refuses accidental overwrite.
+
+Live screenshot claims still require visual inspection. Offline conversion tests prove parser/converter behaviour, not what WH3 happened to render.
+
+## Evidence sessions and conservative soak
+
+Use `wh3_begin_test_session` and `wh3_end_test_session` to bracket a reproducible live check. The evidence session records the MCP transport session, WH3 process/run identity, protocol/server/Lua versions when known, command counts/errors, starting and ending `get_situation` observations, and a structured diagnostics cursor that fixes the per-session log boundary. Screenshots captured with `wh3_screenshot` while the session is active are referenced by hash/metadata rather than embedded into evidence JSON.
+
+`wh3_export_evidence` writes `manifest.json`, `commands.json` and `diagnostics.json` atomically beneath the artifact directory and returns only a compact synopsis/path. The manifest is explicitly `OBSERVATIONS_ONLY`; exporting evidence never awards `RUNTIME_VERIFIED`. If the transport session or WH3 run changes during the bracket, later-run observations are not merged into the earlier run's evidence. Local home-directory names and obvious secret assignments are redacted where practical.
+
+Typical flow:
+
+```text
+wh3_begin_test_session {"label":"wat launcher checkpoint","capture_start_screenshot":true}
+...perform the scenario and bounded waits...
+wh3_screenshot {}
+wh3_end_test_session {"capture_end_screenshot":true}
+wh3_export_evidence {}
+```
+
+`wh3_soak_turns` keeps the existing background Lua soak/status/abort implementation but now uses conservative defaults. `turns` must be 1..200; both per-turn and overall runtime are finite. The runner issues `end_turn` once for each confirmed player turn and does not blindly retry it. It records confirmed turn numbers, policy decisions, blockers and a structured stop reason. Process exit, manual abort, blocker stop and timeout remain distinct; `wh3_soak_status` can return the last server-cached partial report after a process death.
+
+Decision automation is opt-in. By default battles, dilemmas, settlement capture, generic confirmation dialogs and event panels stop the run with evidence. Consequential automation requires both the relevant option and a named permission from `battle`, `dilemma`, `occupation`, `confirm_dialogs`, `dismiss_events`, or `suppress_events`. A retreat request that cannot retreat stops instead of silently becoming an autoresolve; an unavailable occupation/dilemma choice stops instead of falling back to the first choice; move-options interruptions are cancelled rather than auto-declaring war.
+
+A low-risk default soak therefore looks like:
+
+```json
+{"turns": 3, "battle_policy": "stop", "max_seconds_per_turn": 300, "max_runtime_seconds": 1000}
+```
+
+A scenario that intentionally permits specific decisions must say so explicitly, for example:
+
+```json
+{
+  "turns": 2,
+  "battle_policy": "retreat",
+  "dilemma_choice": 1,
+  "permissions": ["battle", "dilemma"]
+}
+```
+
+This is a compatibility tightening, not a second soak system: `wh3_soak_turns`, `wh3_soak_status` and `wh3_soak_abort` remain the public commands, but old callers that relied on implicit autoresolve/choice-1/occupy behaviour must now provide explicit policy and permission arguments.
+
 ## Offline release gate
 
 From `server/` run:

@@ -68,6 +68,7 @@ export class CommandTransport {
     this.requestCounter = 0;
     this.ready = false;
     this.luaInstance = null;
+    this.scriptVersion = null;
     this.context = null;
     this.state = 'RECONNECTING';
     this.activeTransition = null;
@@ -344,6 +345,7 @@ export class CommandTransport {
     if (reply.status === 'ok' && reply.result?.ready === true) {
       this.ready = true;
       this.luaInstance = reply.result?.instance ?? null;
+      this.scriptVersion = reply.result?.script_version ?? null;
       this.context = reply.result?.context ?? null;
       this.state = this.activeTransition?.state === 'TRANSITIONING' ? 'TRANSITIONING' : 'READY';
       if (this.activeTransition && ['RECONNECTING', 'FAILED'].includes(this.activeTransition.state)) {
@@ -543,6 +545,7 @@ export class CommandTransport {
     this.ready = false;
     this.state = 'GAME_EXITED';
     this.luaInstance = null;
+    this.scriptVersion = null;
     this.context = null;
     if (this.activeTransition) {
       this.activeTransition.state = 'GAME_EXITED';
@@ -557,6 +560,7 @@ export class CommandTransport {
     try {
       this.ready = false;
       this.luaInstance = null;
+      this.scriptVersion = null;
       this.context = null;
       this.state = this.isGameRunning() ? 'RECONNECTING' : 'GAME_EXITED';
       this.activeTransition = null;
@@ -577,6 +581,7 @@ export class CommandTransport {
       ready: this.ready,
       state: this.state,
       lua_instance: this.luaInstance,
+      script_version: this.scriptVersion,
       context: this.context,
       active_transition: this.activeTransition,
       last_transition: this.lastTransition,
